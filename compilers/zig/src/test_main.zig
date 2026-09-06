@@ -36,6 +36,7 @@ test {
     _ = @import("tests/private_varlen_state_read.zig");
     _ = @import("tests/private_check_preimage_recursion.zig");
     _ = @import("tests/math_builtins.zig");
+    _ = @import("tests/integer_domain.zig");
     _ = @import("tests/hash_builtins.zig");
     _ = @import("tests/check_multisig.zig");
     _ = @import("tests/language_constructs.zig");

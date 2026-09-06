@@ -1,0 +1,201 @@
+//! Integer-domain parity tests (issue #162).
+//!
+//! The Rúnar language's integer domain is arbitrary-precision: post-Genesis
+//! BSV Script has arbitrary-precision script numbers, the TS reference folder
+//! works on native JS `bigint`, and the Go / Rust / Python / Ruby / Java tiers
+//! all follow. The Zig tier carried THREE different bounds for that one
+//! domain:
+//!
+//!   * the parsers thresholded at `i64` (`parseInt(i64, ...)`), routing
+//!     anything larger to `literal_bigint`;
+//!   * `ConstValue.integer` is `i128`;
+//!   * `emitPushInt` takes `i64`.
+//!
+//! Each mismatch produced a distinct externally-visible defect:
+//!
+//!   D1  operands fit i64 but the folded product does not -> the unchecked
+//!       `@intCast` in `lowerLoadConst` aborts the process (SIGABRT, no
+//!       diagnostic, no source location).
+//!   D2  a bare JSON number beyond i64 in an ANF-IR `load_const` -> the
+//!       loader returns `InvalidConstValue` where Go compiles.
+//!   D3  `builtin_pow` folded with Zig's WRAPPING `*%` on `i128`, so
+//!       `pow(2n, 200n)` folded to `2^200 mod 2^128` == 0 and the tier
+//!       silently emitted `OP_0` in place of a 26-byte push. No abort, no
+//!       error, a different locking script — a miscompile, not an
+//!       availability bug.
+//!   D4  operands ABOVE i64 arrive as `big_integer`, which `evalBinOp` did
+//!       not recognise, so the fold was skipped entirely and Zig emitted a
+//!       runtime `OP_MUL` where the other six tiers emit a folded push.
+//!
+//! Every expected hex below was measured from the Go, Python AND Ruby tiers
+//! on current `main` — all three agree byte-for-byte. These are therefore
+//! cross-tier parity pins, not self-attested Zig goldens.
+
+const std = @import("std");
+const compiler_api = @import("../compiler_api.zig");
+const ir_json = @import("../ir/json.zig");
+
+/// Compile a `.runar.ts` source to locking-script hex. `.runar.ts` rather
+/// than the Zig surface syntax so these sources are byte-for-byte the ones
+/// replayed against the Go / Python / Ruby CLIs when the expectations below
+/// were measured.
+fn compileTs(comptime source: []const u8) ![]const u8 {
+    return compiler_api.compileSourceToHex(std.testing.allocator, source, "Probe.runar.ts");
+}
+
+fn expectHex(comptime source: []const u8, expected: []const u8) !void {
+    const hex = try compileTs(source);
+    defer std.testing.allocator.free(hex);
+    try std.testing.expectEqualStrings(expected, hex);
+}
+
+// ---------------------------------------------------------------------------
+// D1 — folded product escapes i64
+// ---------------------------------------------------------------------------
+
+test "D1: product of two i64-max literals compiles instead of aborting" {
+    // (2^63-1)^2 = 85070591730234615847396907784232501249, a 16-byte push.
+    // Before the fix this aborted the whole process at stack_lower.zig's
+    // `emitPushInt(@intCast(n))` with "integer does not fit in destination
+    // type" and exit code 134.
+    try expectHex(
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\export class Probe extends SmartContract {
+        \\  readonly target: bigint;
+        \\  constructor(target: bigint) { super(target); this.target = target; }
+        \\  public check() {
+        \\    assert((9223372036854775807n * 9223372036854775807n) === this.target);
+        \\  }
+        \\}
+    ,
+        "08ffffffffffffff7f08ffffffffffffff7f100100000000000000ffffffffffffff3f009c7777",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D3 — wrapping fold silently emitted the wrong constant
+// ---------------------------------------------------------------------------
+
+test "D3: pow(2n, 200n) folds to 2^200, not the mod-2^128 residue" {
+    // 2^200 mod 2^128 == 0 exactly, so the wrapping fold emitted a bare OP_0
+    // (`00`) here and the contract compared its argument against zero. This
+    // is the reachable silent-miscompile path: no abort, no diagnostic, just
+    // a different locking script from the other six tiers.
+    try expectHex(
+        \\import { SmartContract, assert, pow } from 'runar-lang';
+        \\
+        \\export class Probe extends SmartContract {
+        \\  readonly target: bigint;
+        \\  constructor(target: bigint) { super(target); this.target = target; }
+        \\  public check() {
+        \\    assert(pow(2n, 200n) === this.target);
+        \\  }
+        \\}
+    ,
+        "5202c8001a0000000000000000000000000000000000000000000000000001009c7777",
+    );
+}
+
+test "D3: mulDiv over above-i64 operands folds without wrapping" {
+    // 2^64 * 2^64 / 2 = 2^127 — fits i128, but only just, and the operands
+    // are themselves above i64, so this covers the builtin arm of D4 too.
+    try expectHex(
+        \\import { SmartContract, assert, mulDiv } from 'runar-lang';
+        \\
+        \\export class Probe extends SmartContract {
+        \\  readonly target: bigint;
+        \\  constructor(target: bigint) { super(target); this.target = target; }
+        \\  public check() {
+        \\    assert(mulDiv(18446744073709551616n, 18446744073709551616n, 2n) === this.target);
+        \\  }
+        \\}
+    ,
+        "090000000000000000010900000000000000000152110000000000000000000000000000008000009c777777",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D4 — operands above i64 are folded, not deferred to runtime opcodes
+// ---------------------------------------------------------------------------
+
+test "D4: product of two above-i64 literals is folded, not emitted as OP_MUL" {
+    const source =
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\export class Probe extends SmartContract {
+        \\  readonly target: bigint;
+        \\  constructor(target: bigint) { super(target); this.target = target; }
+        \\  public check() {
+        \\    assert((1180591620717411303424n * 1180591620717411303424n) === this.target);
+        \\  }
+        \\}
+    ;
+    // 2^70 * 2^70 = 2^140, an 18-byte push. Zig used to emit `95` (OP_MUL)
+    // and defer the multiply to spend time; the other six tiers fold it.
+    try expectHex(
+        source,
+        "090000000000000000400900000000000000004012000000000000000000000000000000000010009c7777",
+    );
+}
+
+test "D4: sum of two above-i64 literals is folded, not emitted as OP_ADD" {
+    // 2^64 + 2^64 = 2^65. Zig used to emit `93` (OP_ADD).
+    try expectHex(
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\export class Probe extends SmartContract {
+        \\  readonly target: bigint;
+        \\  constructor(target: bigint) { super(target); this.target = target; }
+        \\  public check() {
+        \\    assert((18446744073709551616n + 18446744073709551616n) === this.target);
+        \\  }
+        \\}
+    ,
+        "090000000000000000010900000000000000000109000000000000000002009c7777",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D2 — ANF-IR loader accepts bare JSON numbers beyond i64
+// ---------------------------------------------------------------------------
+
+test "D2: load_const with a bare JSON number above i64 loads as .integer" {
+    const ir =
+        \\{"contractName":"Probe","properties":[{"name":"target","type":"bigint","readonly":true}],
+        \\ "methods":[{"name":"check","params":[],"isPublic":true,"body":[
+        \\   {"name":"t0","value":{"kind":"load_const","value":18446744073709551616}},
+        \\   {"name":"t1","value":{"kind":"load_prop","name":"target"}},
+        \\   {"name":"t2","value":{"kind":"bin_op","op":"===","left":"t0","right":"t1"}},
+        \\   {"name":"t3","value":{"kind":"assert","value":"t2"}}]}]}
+    ;
+    const program = try ir_json.parseANFProgram(std.testing.allocator, ir);
+    defer program.deinit(std.testing.allocator);
+
+    // 2^64 exceeds i64 but fits i128, so per the ConstValue contract in
+    // ir/types.zig it must land in `.integer`, not `.big_integer`.
+    try std.testing.expectEqual(
+        @as(i128, 18446744073709551616),
+        program.methods[0].body[0].value.load_const.value.integer,
+    );
+}
+
+test "D2: load_const with a bare JSON number beyond i128 loads as .big_integer" {
+    // 2^200 has no fixed-width home at all; it must round through the
+    // decimal-text variant.
+    const ir =
+        \\{"contractName":"Probe","properties":[{"name":"target","type":"bigint","readonly":true}],
+        \\ "methods":[{"name":"check","params":[],"isPublic":true,"body":[
+        \\   {"name":"t0","value":{"kind":"load_const","value":1606938044258990275541962092341162602522202993782792835301376}},
+        \\   {"name":"t1","value":{"kind":"load_prop","name":"target"}},
+        \\   {"name":"t2","value":{"kind":"bin_op","op":"===","left":"t0","right":"t1"}},
+        \\   {"name":"t3","value":{"kind":"assert","value":"t2"}}]}]}
+    ;
+    const program = try ir_json.parseANFProgram(std.testing.allocator, ir);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "1606938044258990275541962092341162602522202993782792835301376",
+        program.methods[0].body[0].value.load_const.value.big_integer,
+    );
+}
