@@ -49,6 +49,21 @@ fn expectHex(comptime source: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, hex);
 }
 
+/// Compile with the constant folder DISABLED. That mode is not a curiosity:
+/// the checked-in conformance goldens are stamped fold-OFF, so it is the
+/// path every `expected-script.hex` is replayed against.
+fn expectHexFoldOff(comptime source: []const u8, expected: []const u8) !void {
+    const result = try compiler_api.compileSourceWithOptions(
+        std.testing.allocator,
+        source,
+        "Probe.runar.ts",
+        true,
+    );
+    if (result.artifact_json) |json| std.testing.allocator.free(json);
+    defer std.testing.allocator.free(result.script_hex);
+    try std.testing.expectEqualStrings(expected, result.script_hex);
+}
+
 // ---------------------------------------------------------------------------
 // D1 — folded product escapes i64
 // ---------------------------------------------------------------------------
@@ -207,5 +222,56 @@ test "D2: load_const with a bare JSON number beyond i128 loads as .big_integer" 
     try std.testing.expectEqualStrings(
         "1606938044258990275541962092341162602522202993782792835301376",
         program.methods[0].body[0].value.load_const.value.big_integer,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D5 — the peephole's own constant folder truncated to i64
+// ---------------------------------------------------------------------------
+//
+// The peephole runs on Stack IR between passes 5 and 6 and is ALWAYS enabled,
+// including when the ANF constant folder is off. With folding off the literal
+// arithmetic survives lowering as PUSH, PUSH, OP_MUL and the peephole folds it
+// instead -- through `@as(i64, @truncate(...))`, which silently discarded the
+// high bits.
+//
+// This path matters more than the fold-ON one: the checked-in conformance
+// goldens are stamped fold-OFF, so it is what every `expected-script.hex` in
+// the repo is replayed against.
+
+test "D5: peephole folds push/push/OP_MUL at full width, not truncated to i64" {
+    // (2^32-1)^2 = 18446744065119617025. Truncated to i64 that is
+    // -8589934591, which the Zig tier emitted as a 5-byte push where Go,
+    // Rust, Python and Ruby all emit 9 bytes.
+    try expectHexFoldOff(
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\export class Probe extends SmartContract {
+        \\  readonly target: bigint;
+        \\  constructor(target: bigint) { super(target); this.target = target; }
+        \\  public check() {
+        \\    assert((4294967295n * 4294967295n) === this.target);
+        \\  }
+        \\}
+    ,
+        "0901000000feffffff00009c",
+    );
+}
+
+test "D5: peephole folds push/push/OP_ADD past i64 without truncating" {
+    // (2^63-1) + 1 = 2^63, one past the signed 64-bit ceiling. Truncation
+    // turned it into -2^63, flipping the encoded sign byte.
+    try expectHexFoldOff(
+        \\import { SmartContract, assert } from 'runar-lang';
+        \\
+        \\export class Probe extends SmartContract {
+        \\  readonly target: bigint;
+        \\  constructor(target: bigint) { super(target); this.target = target; }
+        \\  public check() {
+        \\    assert((9223372036854775807n + 1n) === this.target);
+        \\  }
+        \\}
+    ,
+        "09000000000000008000009c",
     );
 }

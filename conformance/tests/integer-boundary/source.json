@@ -1,0 +1,13 @@
+{
+  "sources": {
+    ".runar.ts": "../../../examples/ts/integer-boundary/IntegerBoundary.runar.ts",
+    ".runar.sol": "../../../examples/sol/integer-boundary/IntegerBoundary.runar.sol",
+    ".runar.move": "../../../examples/move/integer-boundary/IntegerBoundary.runar.move",
+    ".runar.go": "../../../examples/go/integer-boundary/IntegerBoundary.runar.go",
+    ".runar.rs": "../../../examples/rust/integer-boundary/IntegerBoundary.runar.rs",
+    ".runar.py": "../../../examples/python/integer-boundary/IntegerBoundary.runar.py",
+    ".runar.zig": "../../../examples/zig/integer-boundary/IntegerBoundary.runar.zig",
+    ".runar.rb": "../../../examples/ruby/integer-boundary/IntegerBoundary.runar.rb",
+    ".runar.java": "../../../examples/java/src/main/java/runar/examples/integer-boundary/IntegerBoundary.runar.java"
+  }
+}
