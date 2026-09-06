@@ -177,6 +177,8 @@ fn parseProperties(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]typ
                 }
                 break :blk @as(?types.ConstValue, .{ .string = try allocator.dupe(u8, s) });
             },
+            // A bare JSON number too large for i64 arrives as `.number_string`.
+            .number_string => |s| @as(?types.ConstValue, try constFromNumberString(allocator, s)),
             else => return ParseError.InvalidConstValue,
         } else null;
         result[i] = .{
@@ -388,6 +390,8 @@ fn parseLoadConst(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.
             }
             return .{ .load_const = .{ .value = .{ .string = try allocator.dupe(u8, s) } } };
         },
+        // A bare JSON number too large for i64 arrives as `.number_string`.
+        .number_string => |s| return .{ .load_const = .{ .value = try constFromNumberString(allocator, s) } },
         else => return ParseError.InvalidConstValue,
     }
 }
@@ -398,6 +402,34 @@ fn parseLoadConst(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.
 /// trailing `n` is the discriminator that separates a decimal-encoded BigInt
 /// from a hex-encoded ByteString literal (which never carries the suffix),
 /// so a hex string like "3030" is not mis-decoded as the integer 3030.
+/// True for canonical decimal integer text with no `n` suffix: optional
+/// leading `-` followed by one or more ASCII digits.
+fn isDecimalIntegerText(s: []const u8) bool {
+    const body = if (s.len > 0 and s[0] == '-') s[1..] else s;
+    if (body.len == 0) return false;
+    for (body) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+/// Decode a bare JSON number that did not fit `i64` (issue #162).
+///
+/// `std.json` hands those back as `.number_string` rather than `.integer`,
+/// and the loader used to drop them into its `else` arm and fail the whole
+/// program with `InvalidConstValue` — while the Go tier compiled the same IR.
+/// Integral text within `i128` lands in `.integer` and anything larger in
+/// `.big_integer`, per the ConstValue contract in ir/types.zig. Genuinely
+/// non-integral text (a fraction or exponent) is still rejected: script
+/// numbers are integers.
+fn constFromNumberString(allocator: std.mem.Allocator, s: []const u8) !types.ConstValue {
+    if (!isDecimalIntegerText(s)) return ParseError.InvalidConstValue;
+    if (std.fmt.parseInt(i128, s, 10)) |v| {
+        return .{ .integer = v };
+    } else |_| {}
+    return .{ .big_integer = try allocator.dupe(u8, s) };
+}
+
 fn isDecimalBigIntLiteral(s: []const u8) bool {
     if (s.len < 2 or s[s.len - 1] != 'n') return false;
     var start: usize = 0;

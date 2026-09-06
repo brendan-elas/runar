@@ -169,8 +169,13 @@ test "D2: load_const with a bare JSON number above i64 loads as .integer" {
         \\   {"name":"t2","value":{"kind":"bin_op","op":"===","left":"t0","right":"t1"}},
         \\   {"name":"t3","value":{"kind":"assert","value":"t2"}}]}]}
     ;
-    const program = try ir_json.parseANFProgram(std.testing.allocator, ir);
-    defer program.deinit(std.testing.allocator);
+    // parseANFProgram is arena-owned by convention: ANFProgram.deinit walks
+    // the binding tree but does not free the duped strings, so every json.zig
+    // test wraps it in an arena rather than the raw testing allocator.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const program = try ir_json.parseANFProgram(arena.allocator(), ir);
 
     // 2^64 exceeds i64 but fits i128, so per the ConstValue contract in
     // ir/types.zig it must land in `.integer`, not `.big_integer`.
@@ -191,8 +196,13 @@ test "D2: load_const with a bare JSON number beyond i128 loads as .big_integer" 
         \\   {"name":"t2","value":{"kind":"bin_op","op":"===","left":"t0","right":"t1"}},
         \\   {"name":"t3","value":{"kind":"assert","value":"t2"}}]}]}
     ;
-    const program = try ir_json.parseANFProgram(std.testing.allocator, ir);
-    defer program.deinit(std.testing.allocator);
+    // parseANFProgram is arena-owned by convention: ANFProgram.deinit walks
+    // the binding tree but does not free the duped strings, so every json.zig
+    // test wraps it in an arena rather than the raw testing allocator.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const program = try ir_json.parseANFProgram(arena.allocator(), ir);
 
     try std.testing.expectEqualStrings(
         "1606938044258990275541962092341162602522202993782792835301376",
