@@ -217,6 +217,49 @@ pnpm run sdk-output
 
 The runner compiles each test case with the TypeScript reference compiler and compares the output against the golden files.
 
+### Harness failures vs conformance failures (NEW-003)
+
+The runner separates *"the compilers disagree"* from *"the runner never got an
+answer out of a compiler"*, and gives them different exit codes:
+
+| Exit | Meaning |
+| ---- | ------- |
+| `0`  | All fixtures passed and every compiler subprocess produced usable output. |
+| `1`  | **Conformance failure** — tiers diverged, or a golden did not match. |
+| `2`  | **Harness failure** — a compiler subprocess timed out, was killed by a signal, blew the output-capture cap, or failed to spawn. |
+
+Exit `2` takes precedence over exit `1`: a run whose subprocesses died did not
+measure parity, so its board is not a verdict in *either* direction. Harness
+faults are listed under a `HARNESS FAILURE` banner and each one also emits a
+`::error::conformance harness:` line for CI annotation. Per-fixture error lines
+from a dead subprocess are prefixed `HARNESS:` so the board never shows a
+killed tier as though it had an opinion about the script.
+
+This exists because it silently failed the other way. `runCmd` used to fold a
+signal death (`code === null`) into exit status `0`, so a SIGKILLed compiler
+looked like a successful compile and its half-drained stdout became that tier's
+"script". Two flake shapes came out of that one line:
+
+* pipe empty at kill time → `reported success but produced empty hex: [zig, ruby]`
+* pipe drained mid-write → `majority [6 tiers] vs [x] identical up to length`
+
+Both blamed six innocent tiers for a resource problem. The invariant now pinned
+in `runner/__tests__/subprocess-integrity.test.ts`: **a child that did not exit
+under its own control has no output worth reading**, and neither `--hex` stdout
+nor a `tolerateHexFailure` fallback may be taken from one.
+
+Tuning knobs when a loaded host trips this:
+
+* `RUNAR_CONFORMANCE_COMPILE_TIMEOUT_MS` (default `180000`) — per-invocation
+  budget for a native compiler. It is a **hang detector, not a performance
+  budget**: killing a slow-but-healthy child destroys its output mid-pipe,
+  which is the whole failure mode above, so keep it generous. Worst observed
+  single invocation on an 8-core host is ~5.6s at the default concurrency and
+  ~33s at 10x oversubscription.
+* `RUNAR_CONFORMANCE_CONCURRENCY` (default `max(2, min(8, cpus/4))`) — outer
+  fixture parallelism. Each fixture fans out to up to 7 compiler processes, so
+  the default already runs ~14 children on an 8-core host.
+
 ---
 
 ## How to Add New Test Cases
@@ -390,13 +433,18 @@ Goldens are **self-produced** by the very implementation under test — `pnpm ru
     "sha256": "<sha256 of the NEW file bytes>",
     "verified-against": "official-KAT | second-implementation | differential-oracle | intentional-spec-change",
     "reason": "why the new bytes are correct + which independent oracle confirmed them",
-    "reviewer": "gh:your-handle"
+    "reviewer": "gh:your-handle",
+    "review-status": "reviewed"
   }
   ```
 
-  The entry is **content-pinned**: `sha256` must equal the current bytes of the golden. Because the pin is content-addressed, an entry can only ever justify the *one* value it was reviewed for — a later, *different* regeneration of the same file fails the gate again and forces a fresh, re-reviewed entry. This is what prevents a stale exemption from silently authorizing future silent regenerations. `verified-against` records the class of independent oracle; `reason` and `reviewer` make the sign-off explicit and reviewable in the allowlist diff.
+  The entry is **content-pinned**: `sha256` must equal the current bytes of the golden. Because the pin is content-addressed, an entry can only ever justify the *one* value it was reviewed for — a later, *different* regeneration of the same file fails the gate again and forces a fresh, re-reviewed entry. This is what prevents a stale exemption from silently authorizing future silent regenerations. `verified-against` records the class of independent oracle; `reason` and `reviewer` make the sign-off explicit and reviewable in the allowlist diff. Exactly **one** entry per path — a duplicate `path` is rejected, because the shadowed entry is the one a reviewer would read.
 
-  **`reviewer` must be true, not conventional.** The gate only checks that the field is non-empty, so a pre-filled or invented handle passes it — and a provenance record whose sign-off is fabricated is worse than no record, because it launders exactly the self-regeneration the gate exists to catch. If a tool or an agent produced the entry and no human has checked it yet, say so: set `"reviewer": "unreviewed:<producer>"` **and** `"review-status": "unreviewed"`, and let the reviewer replace both when they actually sign off.
+  **`reviewer` must be true, not conventional — and the gate now enforces it.** A provenance record whose sign-off is fabricated is worse than no record, because it launders exactly the self-regeneration the gate exists to catch. The 2026-08 audit found the earlier version of this rule being satisfied on paper and defeated in practice: 27 entries carried `"reviewer": "unreviewed:generated-by-agent"` **and** `"review-status": "unreviewed"` — a machine-written string that literally records that nobody checked the golden — and the gate accepted every one of them, because it only ever tested that `reviewer` was a non-empty string and never read `review-status` at all.
+
+  The gate therefore now **rejects** any entry whose `reviewer` matches `/^unreviewed:/` or whose `review-status` is anything other than the omitted-legacy case or `"reviewed"` (so `unreviewed`, `pending`, `todo` and typos all fail). A rejected entry justifies nothing: the golden it names is treated as if the entry were absent, and the gate exits non-zero. Both directions are covered by `--self-test` (`b1-unreviewed-reviewer`, `b1-unreviewed-status`, `b1-status-typo`, `b1-reviewed`).
+
+  The practical consequence: **there is no way to park an unreviewed golden in the allowlist.** If you regenerated a golden and cannot yet name the independent oracle that confirms it, do not write a placeholder entry — leave the golden unjustified and let the gate stay red until someone reviews it. `reason` should name the oracle you actually ran and what it reported, and should describe the delta the `sha256` **pin authorizes** (cumulative vs the merge base), not the delta of whichever single commit you happened to be writing up.
 
 **Running it.**
 

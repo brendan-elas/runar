@@ -25,7 +25,7 @@ import { Transaction, P2PKH as BsvP2PKH, PrivateKey, Script, UnlockingScript } f
 import { LocalSigner, computeOpPushTx } from 'runar-sdk';
 import { createProvider } from './helpers/node.js';
 import { createWallet } from './helpers/wallet.js';
-import { rpcCall, mine } from './helpers/node.js';
+import { rpcCall, mine, mineUntilConfirmed } from './helpers/node.js';
 
 describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
   it('broadcasts a P2PKH spend whose sighash is the agreed cross-tier preimage', async () => {
@@ -37,8 +37,23 @@ describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
     const address = priv.toAddress([0x6f]); // regtest p2pkh version byte
 
     await rpcCall('importaddress', address, '', false);
-    const fundTxid = (await rpcCall('sendtoaddress', address, 0.001)) as string;
+    // Mine before funding so the node wallet selects CONFIRMED coins.
+    //
+    // Under a full-suite run the wallet's own change outputs are still
+    // unconfirmed, and `sendtoaddress` happily chains onto them: measured on a
+    // live regtest node, funding without this line produced a tx whose parents
+    // both had 0 confirmations, while funding right after a block produced one
+    // whose parents had 1. An unconfirmed ancestor puts the whole group in
+    // bitcoin-sv's CPFP/secondary mempool instead of the journal, and the
+    // funding tx then never confirms — which is the exact state this test hit.
     await mine(1);
+    const fundTxid = (await rpcCall('sendtoaddress', address, 0.001)) as string;
+    // Confirm the funding tx before spending it, rather than assuming one block
+    // contains it. An unconfirmed parent makes the spend a mempool descendant,
+    // and on bitcoin-sv a descendant cannot enter the journal ahead of its
+    // ancestor — so a lagging parent would surface as the child "never being
+    // selected into a block", which is not what this test is asserting.
+    await mineUntilConfirmed(fundTxid);
 
     // Locate the funded output.
     const fundTx = Transaction.fromHex((await rpcCall('getrawtransaction', fundTxid)) as string);
@@ -98,10 +113,11 @@ describe('BIP-143 cross-tier broadcast (P2PKH, TS reference path)', () => {
     expect(txid).toBeTruthy();
     expect(txid.length).toBe(64);
 
-    // Confirm it actually entered a block.
-    await mine(1);
-    const confirmed = await rpcCall('getrawtransaction', txid, true);
-    expect((confirmed as { confirmations?: number }).confirmations ?? 0).toBeGreaterThan(0);
+    // Confirm it actually entered a block. Mining ONE block is a race under a
+    // full-suite run (see mineUntilConfirmed); the assertion is unchanged, only
+    // the assumption that a single block must contain it.
+    const confirmations = await mineUntilConfirmed(txid);
+    expect(confirmations).toBeGreaterThan(0);
   });
 });
 

@@ -860,6 +860,10 @@ fn eval_value(
             if let Some(s) = raw.as_str() {
                 // Handle @ref: aliases
                 if let Some(target) = s.strip_prefix("@ref:") {
+                    // This binding IS the target's stack slot, so it inherits
+                    // the target's real (possibly non-minimal) bytes — and
+                    // drops any stale entry when the target has none.
+                    alias_script_bytes(script_bytes, target, binding_name);
                     return Ok(env.get(target).cloned().unwrap_or(Val::Undefined));
                 }
             }
@@ -891,7 +895,14 @@ fn eval_value(
                     .unwrap_or_else(|| encode_script_num(left.to_i64()));
                 let rb = if op == "<<" || op == ">>" {
                     // Shift count is read as a number on-chain — only `ab`'s
-                    // length matters.
+                    // length matters. But being read AS A NUMBER means the count
+                    // itself must be minimally encoded, or the shift aborts.
+                    if assert_minimal_numeric_operand(script_bytes, &right_name, &right).is_err() {
+                        return Err(AssertionFailureError {
+                            method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                            binding_name: binding_name.to_string(),
+                        });
+                    }
                     script_num_shift_bytes(&op, &ab, right.to_i64())
                 } else {
                     let bb = script_bytes
@@ -917,6 +928,26 @@ fn eval_value(
                     }
                 }
             } else {
+                // Numeric consumers decode BOTH operands with fRequireMinimal,
+                // so a threaded non-minimal intermediate (e.g. the 1-byte
+                // [0x00] that `1 >> 1` leaves) aborts the script rather than
+                // silently re-minimising to 0. Byte-typed ops are exempt: they
+                // never carry threaded bytes and OP_CAT/OP_EQUAL impose no
+                // numeric decode.
+                let is_bytes_path =
+                    result_type == "bytes" || (left.is_bytes() && right.is_bytes());
+                if is_numeric_consumer_op(&op) && !is_bytes_path {
+                    let non_minimal =
+                        assert_minimal_numeric_operand(script_bytes, &left_name, &left).is_err()
+                            || assert_minimal_numeric_operand(script_bytes, &right_name, &right)
+                                .is_err();
+                    if non_minimal {
+                        return Err(AssertionFailureError {
+                            method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                            binding_name: binding_name.to_string(),
+                        });
+                    }
+                }
                 // A byte-array bitwise/shift op that aborts on-chain (length
                 // mismatch or negative shift) fails the spend; surface it through
                 // the interpreter's rejection channel just like a false assert.
@@ -945,6 +976,17 @@ fn eval_value(
                 script_bytes.insert(binding_name.to_string(), rb);
                 Val::Int(decoded)
             } else {
+                // Every other unary op reads its operand as a script NUMBER
+                // (`-` -> OP_NEGATE) or coerces it to a boolean (`!` ->
+                // OP_NOT), both fRequireMinimal decodes. `~` never reaches
+                // here on the numeric path — it is a byte op and must keep
+                // accepting non-minimal bytes.
+                if assert_minimal_numeric_operand(script_bytes, &operand_name, &operand).is_err() {
+                    return Err(AssertionFailureError {
+                        method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                        binding_name: binding_name.to_string(),
+                    });
+                }
                 eval_unary_op(&op, &operand, result_type)
             }
         }
@@ -955,6 +997,21 @@ fn eval_value(
             let args: Vec<Val> = arg_names.iter()
                 .map(|n| env.get(n).cloned().unwrap_or(Val::Undefined))
                 .collect();
+            // The single funnel every numeric builtin (`abs`, `min`, `max`,
+            // `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+            // operands through. Only a NUMERIC byte-op result ever carries
+            // threaded bytes, and a bigint argument is exactly what those
+            // builtins decode with fRequireMinimal on chain — a ByteString
+            // argument can never carry an entry here, so gating every argument
+            // costs nothing and cannot miss a builtin.
+            for (name, arg) in arg_names.iter().zip(args.iter()) {
+                if assert_minimal_numeric_operand(script_bytes, name, arg).is_err() {
+                    return Err(AssertionFailureError {
+                        method_name: strict.map(|c| c.method_name.clone()).unwrap_or_default(),
+                        binding_name: binding_name.to_string(),
+                    });
+                }
+            }
             // Strict mode: a `call(assert, x)` lowering path enforces the
             // predicate the same way the dedicated `assert` ANF node does.
             if let Some(ctx) = strict {
@@ -1032,8 +1089,10 @@ fn eval_value(
                 for (k, v) in &child_env {
                     env.insert(k.clone(), v.clone());
                 }
-                // Return last binding's value
+                // Return last binding's value — this binding aliases that
+                // slot, so it inherits its raw stack bytes.
                 if let Some(last) = bindings.last() {
+                    alias_script_bytes(script_bytes, &last.name, binding_name);
                     child_env.get(&last.name).cloned().unwrap_or(Val::Undefined)
                 } else {
                     Val::Undefined
@@ -1066,6 +1125,8 @@ fn eval_value(
                         env.insert(k.clone(), v.clone());
                     }
                     if let Some(last) = bindings.last() {
+                        // This binding aliases the body's last slot.
+                        alias_script_bytes(script_bytes, &last.name, binding_name);
                         last_val = loop_env.get(&last.name).cloned().unwrap_or(Val::Undefined);
                     }
                 }
@@ -1232,6 +1293,30 @@ fn decode_script_num(bytes: &[u8]) -> i64 {
 // where the chain spends (and spend where the chain aborts) — a funds-relevant
 // divergence. Mirrors packages/runar-sdk/src/anf-interpreter.ts scriptNumber*Bytes.
 
+/// Carry a binding's raw stack bytes across an ALIAS — a binding whose value IS
+/// another binding's slot: the `load_const "@ref:<name>"` every local rebind
+/// lowers to, an `if` adopting its taken arm's last value, a `loop` adopting its
+/// body's. Without this, a chained length-sensitive op re-minimizes the aliased
+/// value and disagrees with the deployed script (NEW-006: `2 << 8` is a 1-byte
+/// `0x00` on the stack but `[]` when re-minimized from `0`).
+///
+/// Mirrors `05-stack-lower.ts`, which carries its `rawSlots` marker across the
+/// same constructs, and the TS SDK interpreter's `aliasScriptBytes`.
+///
+/// CLEARS when the source has no entry: the alias target is a freshly pushed,
+/// minimal value, so a stale entry left by an earlier binding of the SAME name
+/// (`let m0 = 2 << 8; m0 = 300;`) would otherwise be read as this slot's width.
+fn alias_script_bytes(script_bytes: &mut HashMap<String, Vec<u8>>, from: &str, to: &str) {
+    match script_bytes.get(from).cloned() {
+        Some(bytes) => {
+            script_bytes.insert(to.to_string(), bytes);
+        }
+        None => {
+            script_bytes.remove(to);
+        }
+    }
+}
+
 /// OP_AND / OP_OR / OP_XOR on raw stack bytes. `Err` (carrying the same message
 /// the deployed opcode fails with) on a length mismatch.
 fn script_num_bitwise_bytes(op: &str, av: &[u8], bv: &[u8]) -> Result<Vec<u8>, String> {
@@ -1320,6 +1405,39 @@ fn script_num_invert(a: i64) -> i64 {
 fn script_num_shift(op: &str, a: i64, shift: i64) -> Result<i64, ()> {
     let bytes = script_num_shift_bytes(op, &encode_script_num(a), shift).map_err(|_| ())?;
     Ok(decode_script_num(&bytes))
+}
+
+/// Whether a bin_op consumes its operands NUMERICALLY, i.e. lowers to an opcode
+/// that decodes them with `fRequireMinimal = true`: OP_ADD/OP_SUB/OP_MUL/OP_DIV/
+/// OP_MOD, OP_NUMEQUAL(VERIFY)/OP_NUMNOTEQUAL and the relational ops. The
+/// byte-array ops `& | ^` and a shift's VALUE operand are deliberately absent —
+/// they take raw bytes and only require equal length. `&&`/`||` cast to bool,
+/// which imposes no minimal-encoding requirement either.
+fn is_numeric_consumer_op(op: &str) -> bool {
+    matches!(
+        op,
+        "+" | "-" | "*" | "/" | "%" | "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">="
+    )
+}
+
+/// `Err(())` if `name`'s threaded stack bytes are a NON-minimal encoding of its
+/// decoded value — the exact case a numeric consumer rejects on chain
+/// ("non-minimally encoded script number"). Only byte-array ops thread bytes, so
+/// a ref absent from the side map is minimal by construction and always passes.
+///
+/// Without this, `1 >> 1` (which leaves the 1-byte `[0x00]`, NOT the empty
+/// minimal zero) is re-minimised to `0` by the numeric path: the interpreter
+/// reports a VALID spend for a script that aborts on chain, leaving the UTXO
+/// permanently unspendable.
+fn assert_minimal_numeric_operand(
+    script_bytes: &HashMap<String, Vec<u8>>,
+    name: &str,
+    val: &Val,
+) -> Result<(), ()> {
+    match script_bytes.get(name) {
+        Some(raw) if raw.as_slice() != encode_script_num(val.to_i64()).as_slice() => Err(()),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,11 +1941,21 @@ fn hash_fn_ripemd160(hex: &str) -> Val {
 // Numeric encoding helpers
 // ---------------------------------------------------------------------------
 
+/// `num2bin(n, byte_len)` — exactly what OP_NUM2BIN computes (NEW-013).
+///
+/// The order of the two steps below is load-bearing. This used to set the sign
+/// bit on the last MAGNITUDE byte and pad zeros AFTER it, so `num2bin(-1, 2)`
+/// produced `8100` while the script produces `0180`. The result is the bytes
+/// the SDK puts in the call transaction, so the wrong order built continuations
+/// the deployed script rejects — and six of the seven SDKs shared the mistake,
+/// which is why tier-vs-tier parity never caught it.
+///
+/// The engine pads FIRST and then puts the sign bit on the new most-significant
+/// byte.
 fn num2bin_hex(n: i64, byte_len: usize) -> String {
-    if n == 0 {
-        return "00".repeat(byte_len);
-    }
-
+    // 1. Minimal BSV script-number encoding: little-endian magnitude with the
+    //    sign in bit 7 of the top byte, growing one byte when magnitude data
+    //    already occupies that bit.
     let negative = n < 0;
     let mut abs = if negative { (n as i128).unsigned_abs() } else { n as u128 };
 
@@ -1836,26 +1964,38 @@ fn num2bin_hex(n: i64, byte_len: usize) -> String {
         bytes.push((abs & 0xff) as u8);
         abs >>= 8;
     }
-
-    // Sign bit handling
     if !bytes.is_empty() {
-        if negative {
-            if bytes[bytes.len() - 1] & 0x80 == 0 {
-                let last = bytes.len() - 1;
-                bytes[last] |= 0x80;
-            } else {
-                bytes.push(0x80);
-            }
-        } else if bytes[bytes.len() - 1] & 0x80 != 0 {
-            bytes.push(0x00);
+        let last = bytes.len() - 1;
+        if bytes[last] & 0x80 != 0 {
+            bytes.push(if negative { 0x80 } else { 0x00 });
+        } else if negative {
+            bytes[last] |= 0x80;
         }
     }
 
-    // Pad or truncate
+    // 2a. Field too narrow for the value: OP_NUM2BIN rejects this outright
+    //     ("impossible encoding"). The interpreter keeps its historical
+    //     truncation rather than growing a new failure mode here; an
+    //     equal-length encoding is already final and needs no sign-bit move.
+    if bytes.len() >= byte_len {
+        bytes.truncate(byte_len);
+        return bytes_to_hex(&bytes);
+    }
+
+    // 2b. Padded: lift the sign bit off the magnitude, zero-extend, and
+    //     re-apply it to the byte that is now most significant.
+    let mut sign_bit = 0u8;
+    if !bytes.is_empty() {
+        let last = bytes.len() - 1;
+        sign_bit = bytes[last] & 0x80;
+        bytes[last] &= 0x7f;
+    }
     while bytes.len() < byte_len {
         bytes.push(0x00);
     }
-    bytes.truncate(byte_len);
+    if sign_bit != 0 {
+        bytes[byte_len - 1] |= 0x80;
+    }
 
     bytes_to_hex(&bytes)
 }
@@ -2111,6 +2251,113 @@ mod tests {
         ])
         .expect("(256<<8)&256 must not abort");
         assert_eq!(result.get("count"), Some(&SdkValue::Int(0)));
+    }
+
+    // --- ALIAS threading (NEW-006). A binding whose value IS another
+    // binding's stack slot — the `load_const "@ref:<temp>"` every local rebind
+    // lowers to, an `if` adopting its taken arm's last value, a `loop` adopting
+    // its body's — must carry that slot's real stack bytes. Otherwise the next
+    // length-sensitive op re-minimizes the aliased value and diverges from the
+    // deployed script. Mirrors the TS SDK's `aliasScriptBytes`. ---
+
+    /// PROPAGATE: `let m0 = 2 << 8; m0 | 5`. The shift leaves a NON-minimal
+    /// 1-byte [0x00]; the rebind aliases that slot, so OP_OR([0x00],[0x05]) = 5.
+    /// Without the alias copy the `|` re-minimizes 0 to empty and aborts on the
+    /// length mismatch.
+    #[test]
+    fn test_alias_carries_shift_bytes_then_or_returns_5() {
+        let result = run_expr(vec![
+            b("a", serde_json::json!({ "kind": "load_const", "value": 2 })),
+            b("bb", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "a", "right": "bb" })),
+            // `let m0 = <sh>` — the alias every local binding/rebind lowers to.
+            b("m0", serde_json::json!({ "kind": "load_const", "value": "@ref:sh" })),
+            b("c", serde_json::json!({ "kind": "load_const", "value": 5 })),
+            b("r", serde_json::json!({ "kind": "bin_op", "op": "|", "left": "m0", "right": "c" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("(2<<8) aliased then |5 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(5)));
+    }
+
+    /// CLEAR: `let m0 = 2 << 8; m0 = 300; m0 & 255`. The second rebind aliases a
+    /// freshly pushed minimal 300 ([0x2c,0x01]), so OP_AND with 255
+    /// ([0xff,0x00]) = [0x2c,0x00] = 44.
+    ///
+    /// HONEST NOTE: this PASSES against the unfixed interpreter (nothing ever
+    /// keys the side map by an alias's own name today). It is the guard that
+    /// forces the alias to CLEAR as well as copy: a copy-ONLY fix leaves the
+    /// dead 1-byte [0x00] from the shift under `m0` and reads it as the width
+    /// of a slot that now holds [0x2c,0x01], which is the worse failure mode.
+    #[test]
+    fn test_alias_clears_stale_bytes_on_rebind_then_and_returns_44() {
+        let result = run_expr(vec![
+            b("a", serde_json::json!({ "kind": "load_const", "value": 2 })),
+            b("bb", serde_json::json!({ "kind": "load_const", "value": 8 })),
+            b("sh", serde_json::json!({ "kind": "bin_op", "op": "<<", "left": "a", "right": "bb" })),
+            b("m0", serde_json::json!({ "kind": "load_const", "value": "@ref:sh" })),
+            // `m0 = 300` — same binding name, now aliasing a plain constant.
+            b("k", serde_json::json!({ "kind": "load_const", "value": 300 })),
+            b("m0", serde_json::json!({ "kind": "load_const", "value": "@ref:k" })),
+            b("c", serde_json::json!({ "kind": "load_const", "value": 255 })),
+            b("r", serde_json::json!({ "kind": "bin_op", "op": "&", "left": "m0", "right": "c" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("300 & 255 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(44)));
+    }
+
+    /// PROPAGATE across an `if`: the taken arm's last binding is `2 << 8`, the
+    /// `if` node's own binding adopts that slot, and `| 5` must see [0x00].
+    #[test]
+    fn test_if_result_carries_branch_shift_bytes() {
+        let result = run_expr(vec![
+            b("t", serde_json::json!({ "kind": "load_const", "value": 1 })),
+            b(
+                "iff",
+                serde_json::json!({
+                    "kind": "if",
+                    "cond": "t",
+                    "then": [
+                        { "name": "_a0", "value": { "kind": "load_const", "value": 2 } },
+                        { "name": "_a1", "value": { "kind": "load_const", "value": 8 } },
+                        { "name": "_a2", "value": { "kind": "bin_op", "op": "<<", "left": "_a0", "right": "_a1" } },
+                    ],
+                    "else": [],
+                }),
+            ),
+            b("c", serde_json::json!({ "kind": "load_const", "value": 5 })),
+            b("r", serde_json::json!({ "kind": "bin_op", "op": "|", "left": "iff", "right": "c" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("if-result (2<<8) then |5 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(5)));
+    }
+
+    /// PROPAGATE across a `loop`: the body's last binding is `2 << 8`, the loop
+    /// node's own binding adopts that slot, and `| 5` must see [0x00].
+    #[test]
+    fn test_loop_result_carries_body_shift_bytes() {
+        let result = run_expr(vec![
+            b(
+                "lp",
+                serde_json::json!({
+                    "kind": "loop",
+                    "count": 1,
+                    "iterVar": "_i",
+                    "body": [
+                        { "name": "_b0", "value": { "kind": "load_const", "value": 2 } },
+                        { "name": "_b1", "value": { "kind": "load_const", "value": 8 } },
+                        { "name": "_b2", "value": { "kind": "bin_op", "op": "<<", "left": "_b0", "right": "_b1" } },
+                    ],
+                }),
+            ),
+            b("c", serde_json::json!({ "kind": "load_const", "value": 5 })),
+            b("r", serde_json::json!({ "kind": "bin_op", "op": "|", "left": "lp", "right": "c" })),
+            b("_", serde_json::json!({ "kind": "update_prop", "name": "count", "value": "r" })),
+        ])
+        .expect("loop-result (2<<8) then |5 must not abort");
+        assert_eq!(result.get("count"), Some(&SdkValue::Int(5)));
     }
 
     #[test]
@@ -2473,5 +2720,94 @@ mod real_crypto_tests {
         assert!(OnChainCryptoContext::from_hex("00").is_err());
         assert!(OnChainCryptoContext::from_hex("zz").is_err());
         assert!(OnChainCryptoContext::from_hex("00112233").is_err());
+    }
+
+    // NEW-013 — `num2bin` sign-bit placement.
+    //
+    // The ANF interpreter models what the DEPLOYED SCRIPT computes. For
+    // negative values it used to set the sign bit on the last MAGNITUDE byte
+    // and pad zeros AFTER it, so `num2bin(-1, 2)` came out `8100` where
+    // OP_NUM2BIN yields `0180`. Those bytes go into the call transaction, so a
+    // legal method built a continuation the script rejects.
+    //
+    // Every expectation below is the output of OP_NUM2BIN on the real
+    // `@bsv/sdk` Spend interpreter, derived by
+    // `conformance/anf-interpreter/num2bin-engine-parity.test.ts`, which
+    // re-runs the engine live rather than trusting a table. Do NOT re-stamp
+    // these from this implementation's own output — that is precisely how six
+    // of seven SDKs agreed on the wrong answer.
+    #[test]
+    fn num2bin_hex_matches_op_num2bin() {
+        // (value, width, expected, why)
+        let cases: &[(i64, usize, &str, &str)] = &[
+            // Negative, padded — the NEW-013 corner. The sign bit belongs on
+            // the byte that is most significant AFTER padding, not before it.
+            (-1, 2, "0180", "negative padded"),
+            (-1, 4, "01000080", "negative padded"),
+            (-1, 8, "0100000000000080", "negative padded"),
+            (-5, 4, "05000080", "negative padded"),
+            (-1000, 4, "e8030080", "negative padded"),
+            (-1000, 8, "e803000000000080", "negative padded"),
+            (-255, 3, "ff0080", "negative padded"),
+            (-256, 3, "000180", "negative padded"),
+            // Negative, exact width — the minimal encoding already fills the
+            // field, so it is pushed unchanged and the sign bit does not move.
+            (-1, 1, "81", "negative exact width"),
+            (-127, 1, "ff", "negative exact width"),
+            (-1000, 2, "e883", "negative exact width"),
+            (-256, 2, "0081", "negative exact width"),
+            // Negative, sign-bit carry — the top magnitude byte already uses
+            // bit 7, so the minimal encoding grows a byte before padding.
+            (-128, 2, "8080", "negative carry, exact width"),
+            (-128, 3, "800080", "negative carry, padded"),
+            (-128, 8, "8000000000000080", "negative carry, padded"),
+            (-32768, 3, "008080", "negative carry, exact width"),
+            (-32768, 4, "00800080", "negative carry, padded"),
+            // Positive at the same widths — must be untouched by the fix.
+            (1, 1, "01", "positive exact width"),
+            (1, 2, "0100", "positive padded"),
+            (1, 8, "0100000000000000", "positive padded"),
+            (1000, 2, "e803", "positive exact width"),
+            (1000, 4, "e8030000", "positive padded"),
+            (1000, 8, "e803000000000000", "positive padded"),
+            (127, 1, "7f", "positive exact width"),
+            (128, 2, "8000", "positive carry, exact width"),
+            (128, 3, "800000", "positive carry, padded"),
+            (255, 2, "ff00", "positive carry, exact width"),
+            // Zero — an all-zero field, no sign bit anywhere.
+            (0, 1, "00", "zero"),
+            (0, 4, "00000000", "zero"),
+            (0, 8, "0000000000000000", "zero"),
+        ];
+
+        for (n, width, want, why) in cases {
+            assert_eq!(
+                &num2bin_hex(*n, *width),
+                want,
+                "num2bin({}, {}) [{}]",
+                n,
+                width,
+                why
+            );
+        }
+
+        // Non-vacuity: this table only earns its keep if it can see the pre-fix
+        // answer. `8100` is exactly what this function used to return.
+        assert_ne!(
+            num2bin_hex(-1, 2),
+            "8100",
+            "num2bin_hex regressed to the pre-fix sign-bit placement"
+        );
+    }
+
+    // bin2num is the interpreter's own inverse, so a round-trip proves only
+    // self-consistency — it held throughout the bug. Kept as a smoke test; it
+    // is explicitly NOT the evidence.
+    #[test]
+    fn num2bin_hex_round_trip_is_smoke_test_only() {
+        for n in [-1000i64, -128, -1, 0, 1, 128, 1000] {
+            let hex = num2bin_hex(n, 8);
+            assert_eq!(bin2num_i64(&hex), n, "round trip of {} through {}", n, hex);
+        }
     }
 }

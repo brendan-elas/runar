@@ -6,6 +6,7 @@ import type { RunarArtifact, ABIMethod } from 'runar-ir-schema';
 import { InputLimits } from 'runar-ir-schema';
 import { assertScriptHexUnderLimit, WitnessValueMissingError } from './errors.js';
 import type { Provider } from './providers/provider.js';
+import { txToTransactionData } from './providers/provider.js';
 import type { Signer } from './signers/signer.js';
 import type { TransactionData, UTXO, DeployOptions, CallOptions, PreparedCall } from './types.js';
 import type { Inscription } from './ordinals/types.js';
@@ -19,6 +20,7 @@ import type { OrderedOutputEntry } from './anf-interpreter.js';
 import { buildInscriptionEnvelope, parseInscriptionEnvelope } from './ordinals/envelope.js';
 import { Utils, Hash, Transaction as BsvTransaction, LockingScript, UnlockingScript, Spend } from '@bsv/sdk';
 import { WalletProvider } from './providers/wallet-provider.js';
+import { detachUnlockingScript } from './spend-safety.js';
 
 /**
  * Deep-review finding C8: opt-out for `finalizeCall`'s pre-broadcast local
@@ -76,7 +78,9 @@ declare module './types.js' {
 /**
  * Producer-side marker (issue #106) for the deliberately-empty branch of an
  * OR-CHECKSIG method — `checkSig(sigA, pkA) || checkSig(sigB, pkB)`, where
- * `||` lowers to the non-lazy `OP_BOOLOR` so BOTH `OP_CHECKSIG`s run. Only the
+ * `||` short-circuits (NEW-014), so the second `OP_CHECKSIG` runs only when the
+ * first branch FAILS — and when it does, the first ran with a non-empty
+ * signature. Only the
  * matching branch supplies a real signature; the failing branch MUST push an
  * empty signature (OP_0) or BIP146 NULLFAIL rejects the whole spend.
  *
@@ -112,6 +116,44 @@ const consumedPreparedCalls = new WeakSet<PreparedCall>();
 /** Type guard: is this call arg the {@link EMPTY_SIG} marker (issue #106)? */
 export function isEmptySig(value: unknown): value is typeof EMPTY_SIG {
   return value === EMPTY_SIG;
+}
+
+/**
+ * True when the locking script looks like OR-CHECKSIG (OP_BOOLOR + OP_CHECKSIG)
+ * rather than multi-sig (OP_CHECKMULTISIG). Used to scope the multi-null-Sig
+ * soft warning so genuine checkMultiSig unlocks are not spammed.
+ *
+ * Exported for unit tests.
+ */
+export function isLikelyOrCheckSigMethod(artifact: {
+  asm?: string;
+  script?: string;
+  scriptHex?: string;
+}): boolean {
+  const asm = (artifact.asm ?? '').toUpperCase();
+  if (asm.includes('OP_CHECKMULTISIG')) {
+    return false;
+  }
+  if (asm.includes('OP_BOOLOR') && asm.includes('OP_CHECKSIG')) {
+    return true;
+  }
+  // NEW-014: `||` no longer lowers to OP_BOOLOR — it lowers to real
+  // OP_IF / OP_ELSE / OP_ENDIF control flow. The NULLFAIL hazard SURVIVES that
+  // change: when the FIRST branch fails, its OP_CHECKSIG has already run with a
+  // non-empty signature, which is exactly what BIP146 rejects. Short-circuiting
+  // only removes the hazard when the first branch succeeds, so this warning
+  // must still fire for the branch-shaped form.
+  if (asm.includes('OP_IF') && asm.includes('OP_CHECKSIG')) {
+    return true;
+  }
+  // Fall back to hex when ASM is missing: OP_CHECKMULTISIG=0xae, OP_BOOLOR=0x9a
+  const hex = (artifact.script ?? artifact.scriptHex ?? '').toLowerCase();
+  if (hex.includes('ae') || hex.includes('af')) {
+    // May false-positive inside push data; prefer ASM. If ASM empty and we see
+    // ae, treat as multi-sig (safe: suppresses warning for MultiSig contracts).
+    if (!asm) return false;
+  }
+  return false;
 }
 
 /**
@@ -197,7 +239,12 @@ function dryRunContractInput(
       otherInputs: otherInputs as unknown as ConstructorParameters<typeof Spend>[0]['otherInputs'],
       outputs: tx.outputs,
       inputIndex,
-      unlockingScript: input.unlockingScript!,
+      // NEW-005: `Spend` mutates the script it executes in place, so it must
+      // never be handed the live in-flight input's own object — the dry-run
+      // would corrupt every evaluation that follows it (including
+      // `MockProvider.validateBroadcastTx`, one line later in `finalizeCall`).
+      // See spend-safety.ts.
+      unlockingScript: detachUnlockingScript(input.unlockingScript!),
       inputSequence: input.sequence ?? 0xffffffff,
       lockTime: tx.lockTime,
     });
@@ -530,15 +577,12 @@ export class RunarContract {
     };
 
     const txData = await provider.getTransaction(txid).catch((err) => {
+      // Audit finding C4: the fallback reports the transaction this SDK
+      // actually broadcast, not an empty `inputs: []` / `outputs: []` shell
+      // that reads as a real confirmed tx. The warn stays — this is
+      // locally-derived, unconfirmed data.
       console.warn('Failed to fetch transaction after broadcast:', err);
-      return {
-        txid,
-        version: 1,
-        inputs: [],
-        outputs: [{ satoshis: deploySatoshis, script: lockingScript }],
-        locktime: 0,
-        raw: tx.toHex(),
-      };
+      return txToTransactionData(txid, tx);
     });
 
     return { txid, tx: txData };
@@ -865,13 +909,15 @@ export class RunarContract {
       // in `resolvedArgs` and `encodeArg` emits OP_0 (empty sig) for it.
     }
 
-    // Soft heuristic (issue #106): more than one auto-signed Sig slot usually
-    // means an OR-CHECKSIG method whose non-matching branch should use
-    // EMPTY_SIG instead — otherwise every branch gets the same real signature
-    // and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
-    // AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
-    // informational only (the ABI does not encode OR-vs-AND topology).
-    if (sigIndices.length >= 2) {
+    // Soft heuristic (issue #106): more than one auto-signed Sig slot on an
+    // OR-CHECKSIG method (`checkSig || checkSig` → OP_BOOLOR) usually means
+    // the non-matching branch should use EMPTY_SIG — otherwise every branch
+    // gets the same real signature and the failing CHECKSIG trips BIP146
+    // NULLFAIL on broadcast.
+    //
+    // Do NOT warn for genuine multi-sig (OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY):
+    // those require multiple real signatures (AND-style), not EMPTY_SIG.
+    if (sigIndices.length >= 2 && isLikelyOrCheckSigMethod(this.artifact)) {
       console.warn(
         `runar-sdk: ${this.artifact.contractName}.call('${methodName}') has ` +
           `${sigIndices.length} auto-signed Sig slots. If this is an OR-CHECKSIG ` +
@@ -1177,8 +1223,22 @@ export class RunarContract {
             satoshis: Number(d.satoshis),
           }));
         }
-      } catch {
-        // ANF interp failures fall through to the legacy newState-only path.
+      } catch (err) {
+        // FAIL CLOSED (NEW-006). The legacy behaviour was to swallow this and
+        // build the continuation from the CURRENT state, which the covenant's
+        // hashOutputs binding then rejects — a silent "your call cannot be
+        // broadcast", plus silent loss of the method's data / raw outputs.
+        // The interpreter is the only thing that knows this method's post-state
+        // and its addDataOutput/addRawOutput payloads, so there is nothing to
+        // fall back TO: an explicit `newState` covers only the state field and
+        // still leaves the outputs missing.
+        throw new Error(
+          `RunarContract.call('${methodName}'): the ANF interpreter could not evaluate ` +
+            `the method body, so the state continuation and data outputs this call would ` +
+            `commit cannot be derived. Refusing to broadcast a transaction built from the ` +
+            `pre-call state. Cause: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
       }
     }
 
@@ -1782,15 +1842,9 @@ export class RunarContract {
     }
 
     const txData = await provider.getTransaction(txid).catch((err) => {
+      // Audit finding C4 — see the peer fallback in `deploy()`.
       console.warn('Failed to fetch transaction after broadcast:', err);
-      return {
-        txid,
-        version: 1,
-        inputs: [],
-        outputs: [],
-        locktime: 0,
-        raw: finalTx.toHex(),
-      };
+      return txToTransactionData(txid, finalTx);
     });
 
     return { txid, tx: txData };

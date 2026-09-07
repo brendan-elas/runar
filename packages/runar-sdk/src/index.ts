@@ -30,7 +30,15 @@ export { LocalSigner, MockSigner, ExternalSigner, WalletSigner } from './signers
 export type { Signer, SignCallback, WalletSignerOptions } from './signers/index.js';
 
 // Contract
-export { RunarContract, encodeArg, encodePushData, encodeScriptNumber, EMPTY_SIG, isEmptySig } from './contract.js';
+export {
+  RunarContract,
+  encodeArg,
+  encodePushData,
+  encodeScriptNumber,
+  EMPTY_SIG,
+  isEmptySig,
+  isLikelyOrCheckSigMethod,
+} from './contract.js';
 
 // Cross-artifact transaction assembly (N different-artifact covenant inputs in one tx)
 export { assembleMultiContractCall, dryRunMultiContractInput } from './multi-contract.js';
@@ -62,6 +70,10 @@ export { computeOpPushTx } from './oppushtx.js';
 
 // Script utilities
 export { buildP2PKHScript, extractConstructorArgs, matchesArtifact, pubkeyToPKH } from './script-utils.js';
+
+// Spend-safety (NEW-005): @bsv/sdk's `Spend` mutates the scripts it executes,
+// so any harness that replays a live transaction must detach them first.
+export { detachLockingScript, detachUnlockingScript } from './spend-safety.js';
 
 // Verification-descriptor resolution (value-dependent half of the artifact's
 // constructorSlots/stateFields/templateDigest descriptors)

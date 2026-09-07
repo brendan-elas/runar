@@ -1,6 +1,7 @@
 package runar
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -622,6 +623,7 @@ func anfEvalValue(
 		v := value["value"]
 		// Handle @ref: aliases
 		if s, ok := v.(string); ok && strings.HasPrefix(s, "@ref:") {
+			anfAliasScriptBytes(scriptBytes, s[5:], bindingName)
 			return env[s[5:]]
 		}
 		return v
@@ -645,9 +647,11 @@ func anfEvalValue(
 			}
 			var rb []byte
 			if op == "<<" || op == ">>" {
-				// Shift count is read as a number on-chain — only `ab`'s
-				// length is significant, so the count operand's bytes are
-				// never consulted.
+				// Shift count is read as a NUMBER on-chain — it therefore
+				// decodes with fRequireMinimal and aborts on a non-minimal
+				// operand. Only `ab`'s length is significant otherwise, so
+				// the count operand's bytes are never consulted for width.
+				anfAssertMinimalNumericOperand(scriptOpcodeName(op), rightName, env, scriptBytes)
 				rb = anfScriptNumShiftBytes(op, ab, anfToBigInt(env[rightName]))
 			} else {
 				bb, okr := scriptBytes[rightName]
@@ -658,6 +662,15 @@ func anfEvalValue(
 			}
 			scriptBytes[bindingName] = rb
 			return anfBin2numBigInt(hex.EncodeToString(rb))
+		}
+		// Every NUMERIC consumer decodes its operands with fRequireMinimal on
+		// chain and aborts on a non-minimal encoding. A shift result is
+		// length-preserving and can be non-minimal (`1 >> 1` leaves [0x00]),
+		// so the threaded bytes — not the re-minimised value — decide whether
+		// the deployed script spends here.
+		if opcode := anfNumericConsumerOpcode(op); opcode != "" {
+			anfAssertMinimalNumericOperand(opcode, leftName, env, scriptBytes)
+			anfAssertMinimalNumericOperand(opcode, rightName, env, scriptBytes)
 		}
 		return anfEvalBinOp(op, env[leftName], env[rightName], resultType)
 
@@ -677,6 +690,11 @@ func anfEvalValue(
 			scriptBytes[bindingName] = rb
 			return anfBin2numBigInt(hex.EncodeToString(rb))
 		}
+		// Every other unary op reads its operand as a script NUMBER
+		// (`-` -> OP_NEGATE) or coerces it to a boolean (`!` -> OP_NOT), both
+		// fRequireMinimal decodes. `~` never reaches here on the numeric path
+		// — it is a byte op and must keep accepting non-minimal bytes.
+		anfAssertMinimalNumericOperand(anfUnaryOperandContext(op), operandName, env, scriptBytes)
 		return anfEvalUnaryOp(op, env[operandName], resultType)
 
 	case "call":
@@ -685,6 +703,16 @@ func anfEvalValue(
 		argVals := make([]interface{}, len(argNames))
 		for i, name := range argNames {
 			argVals[i] = env[name]
+		}
+		// The single funnel every numeric builtin (`abs`, `min`, `max`,
+		// `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+		// operands through. Only a NUMERIC byte-op result ever carries
+		// threaded bytes, and a bigint-typed argument is exactly what those
+		// builtins decode with fRequireMinimal on chain — a ByteString
+		// argument can never carry an entry here, so gating every argument
+		// costs nothing and cannot miss a builtin.
+		for _, name := range argNames {
+			anfAssertMinimalNumericOperand("numeric operand", name, env, scriptBytes)
 		}
 		// Strict mode: a `call(assert, x)` lowering path enforces the
 		// predicate the same way the dedicated `assert` ANF node does.
@@ -776,7 +804,9 @@ func anfEvalValue(
 		}
 		// Return last binding's value
 		if len(branch) > 0 {
-			return childEnv[branch[len(branch)-1].Name]
+			lastName := branch[len(branch)-1].Name
+			anfAliasScriptBytes(scriptBytes, lastName, bindingName)
+			return childEnv[lastName]
 		}
 		return nil
 
@@ -806,7 +836,9 @@ func anfEvalValue(
 				env[k] = v
 			}
 			if len(body) > 0 {
-				lastVal = loopEnv[body[len(body)-1].Name]
+				lastName := body[len(body)-1].Name
+				anfAliasScriptBytes(scriptBytes, lastName, bindingName)
+				lastVal = loopEnv[lastName]
 			}
 		}
 		return lastVal
@@ -1697,11 +1729,22 @@ func anfToInt(v interface{}) int64 {
 // Byte encoding helpers
 // ---------------------------------------------------------------------------
 
+// anfNum2binHex is `num2bin(n, byteLen)` — exactly what OP_NUM2BIN computes
+// (NEW-013).
+//
+// The order of the two steps below is load-bearing. This used to set the sign
+// bit on the last MAGNITUDE byte and pad zeros AFTER it, so num2bin(-1, 2)
+// produced 8100 while the script produces 0180. The result is the bytes the SDK
+// puts in the call transaction, so the wrong order built continuations the
+// deployed script rejects — and six of the seven SDKs shared the mistake, which
+// is why tier-vs-tier parity never caught it.
+//
+// The engine pads FIRST and then puts the sign bit on the new most-significant
+// byte.
 func anfNum2binHex(n *big.Int, byteLen int) string {
-	if n.Sign() == 0 {
-		return strings.Repeat("00", byteLen)
-	}
-
+	// 1. Minimal BSV script-number encoding: little-endian magnitude with the
+	//    sign in bit 7 of the top byte, growing one byte when magnitude data
+	//    already occupies that bit.
 	negative := n.Sign() < 0
 	abs := new(big.Int).Abs(n)
 
@@ -1711,28 +1754,38 @@ func anfNum2binHex(n *big.Int, byteLen int) string {
 		bytes = append(bytes, b)
 		abs.Rsh(abs, 8)
 	}
-
-	// Sign bit handling
 	if len(bytes) > 0 {
-		if negative {
-			if bytes[len(bytes)-1]&0x80 == 0 {
-				bytes[len(bytes)-1] |= 0x80
-			} else {
+		if bytes[len(bytes)-1]&0x80 != 0 {
+			if negative {
 				bytes = append(bytes, 0x80)
-			}
-		} else {
-			if bytes[len(bytes)-1]&0x80 != 0 {
+			} else {
 				bytes = append(bytes, 0x00)
 			}
+		} else if negative {
+			bytes[len(bytes)-1] |= 0x80
 		}
 	}
 
-	// Pad or truncate
+	// 2a. Field too narrow for the value: OP_NUM2BIN rejects this outright
+	//     ("impossible encoding"). The interpreter keeps its historical
+	//     truncation rather than growing a new failure mode here; an
+	//     equal-length encoding is already final and needs no sign-bit move.
+	if len(bytes) >= byteLen {
+		return hex.EncodeToString(bytes[:byteLen])
+	}
+
+	// 2b. Padded: lift the sign bit off the magnitude, zero-extend, and
+	//     re-apply it to the byte that is now most significant.
+	var signBit byte
+	if len(bytes) > 0 {
+		signBit = bytes[len(bytes)-1] & 0x80
+		bytes[len(bytes)-1] &^= 0x80
+	}
 	for len(bytes) < byteLen {
 		bytes = append(bytes, 0x00)
 	}
-	if len(bytes) > byteLen {
-		bytes = bytes[:byteLen]
+	if signBit != 0 {
+		bytes[byteLen-1] |= 0x80
 	}
 
 	return hex.EncodeToString(bytes)
@@ -1834,6 +1887,88 @@ func scriptOpcodeName(op string) string {
 	return op
 }
 
+// anfNumericConsumerOpcode maps a source operator to the Bitcoin Script opcode
+// it lowers to, but ONLY for operators that consume their operands as SCRIPT
+// NUMBERS. Those opcodes decode with fRequireMinimal=true and abort on a
+// non-minimally-encoded operand. Returns "" for every other operator —
+// notably the byte-array ops `& | ^ ~` (which take non-minimal bytes and only
+// require equal length) and the boolean ops `&& ||` (OP_BOOLAND/OP_BOOLOR read
+// truthiness, not a decoded number).
+func anfNumericConsumerOpcode(op string) string {
+	switch op {
+	case "+":
+		return "OP_ADD"
+	case "-":
+		return "OP_SUB"
+	case "*":
+		return "OP_MUL"
+	case "/":
+		return "OP_DIV"
+	case "%":
+		return "OP_MOD"
+	case "==", "===":
+		return "OP_NUMEQUAL"
+	case "!=", "!==":
+		return "OP_NUMNOTEQUAL"
+	case "<":
+		return "OP_LESSTHAN"
+	case "<=":
+		return "OP_LESSTHANOREQUAL"
+	case ">":
+		return "OP_GREATERTHAN"
+	case ">=":
+		return "OP_GREATERTHANOREQUAL"
+	}
+	return ""
+}
+
+// anfUnaryOperandContext names the way a unary op consumes its operand, for
+// the abort message. `-` lowers to OP_NEGATE (a script-number decode) and `!`
+// to OP_NOT (a numeric truthiness decode); both are fRequireMinimal. `~` is a
+// byte op handled on its own path and never reaches here numerically.
+func anfUnaryOperandContext(op string) string {
+	if op == "!" {
+		return "boolean coercion"
+	}
+	return "numeric operand"
+}
+
+// anfAssertMinimalNumericOperand aborts when the operand bound to `name`
+// carries threaded stack bytes that are NOT the minimal encoding of its
+// decoded value — exactly the condition on which a numeric opcode's
+// fRequireMinimal decode fails on chain.
+//
+// Only bindings produced by a byte-array op appear in `scriptBytes`; every
+// other value is minimal on chain, so an absent entry is always fine. The
+// check is deliberately confined to the numeric consumers (see
+// anfNumericConsumerOpcode): OP_AND/OP_OR/OP_XOR/OP_INVERT and a shift's VALUE
+// operand legitimately take non-minimal bytes, so rejecting them here would
+// break spends the chain accepts (see
+// conformance/fuzz-regressions/entries/2026-07-14-chained-shift-or-nonminimal).
+func anfAssertMinimalNumericOperand(
+	opcode, name string,
+	env map[string]interface{},
+	scriptBytes map[string][]byte,
+) {
+	raw, ok := scriptBytes[name]
+	if !ok {
+		return
+	}
+	minimal := anfScriptNumEncode(anfBin2numBigInt(hex.EncodeToString(raw)))
+	if bytes.Equal(raw, minimal) {
+		return
+	}
+	panic(&ScriptOpcodeError{
+		Opcode: opcode,
+		Message: fmt.Sprintf(
+			"non-minimally encoded script number (operand bytes %s decode to %s, minimal encoding is %s)",
+			hex.EncodeToString(raw),
+			anfBin2numBigInt(hex.EncodeToString(raw)),
+			hex.EncodeToString(minimal),
+		),
+	})
+}
+
 // anfIsNumericByteOp reports whether a `bin_op` should evaluate through the
 // byte-threading path rather than anfEvalBinOp's minimal-operand path. It is
 // true exactly when the operator is one of the byte-array ops (& | ^ << >>)
@@ -1866,6 +2001,25 @@ func anfIsNumericByteOp(op, resultType string, left, right interface{}) bool {
 // agree with the deployed script. The interpreter threads these bytes via a
 // per-binding side map (see anfEvalValue); values from other sources are
 // minimal on-chain, so their bytes come from anfScriptNumEncode.
+
+// anfAliasScriptBytes carries a binding's raw stack bytes across an ALIAS -- a
+// binding whose value IS another binding's slot: the `load_const "@ref:<name>"`
+// every local rebind lowers to, an `if` adopting its taken arm's last value, a
+// `loop` adopting its body's. Without it a chained length-sensitive op
+// re-minimizes the aliased value and disagrees with the deployed script
+// (NEW-006). Mirrors the `rawSlots` marker 05-stack-lower.ts carries across the
+// same constructs.
+//
+// CLEARS when the source has no entry: the alias target is a freshly pushed,
+// minimal value, so a stale entry left by an earlier binding of the SAME name
+// (`let m0 = 4n ^ 4n; m0 = 300n;`) must not be read as this slot's width.
+func anfAliasScriptBytes(scriptBytes map[string][]byte, from, to string) {
+	if b, ok := scriptBytes[from]; ok {
+		scriptBytes[to] = b
+	} else {
+		delete(scriptBytes, to)
+	}
+}
 
 // anfScriptNumBitwiseBytes implements OP_AND/OP_OR/OP_XOR on raw stack bytes.
 // Panics with *ScriptOpcodeError on operand length mismatch, exactly like the

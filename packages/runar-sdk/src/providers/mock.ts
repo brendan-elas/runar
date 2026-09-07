@@ -3,7 +3,9 @@
 // ---------------------------------------------------------------------------
 
 import { Spend, LockingScript, type Transaction } from '@bsv/sdk';
+import { detachUnlockingScript } from '../spend-safety.js';
 import type { Provider } from './provider.js';
+import { txToTransactionData } from './provider.js';
 import type { TransactionData, UTXO } from '../types.js';
 import { InputLimits } from 'runar-ir-schema';
 import { assertScriptHexUnderLimit } from '../errors.js';
@@ -88,7 +90,10 @@ function validateBroadcastTx(
         otherInputs,
         outputs: tx.outputs,
         inputIndex: i,
-        unlockingScript: input.unlockingScript!,
+        // NEW-005: `Spend` mutates the script it executes in place. `tx` is the
+        // CALLER's live transaction object, so validating it must not leave it
+        // unevaluable — hand `Spend` a private copy. See spend-safety.ts.
+        unlockingScript: detachUnlockingScript(input.unlockingScript!),
         inputSequence: input.sequence ?? 0xffffffff,
         lockTime: tx.lockTime,
       });
@@ -373,6 +378,15 @@ export class MockProvider implements Provider {
 
     // Auto-store raw hex for subsequent getRawTransaction lookups
     this.rawTransactions.set(fakeTxid, rawTx);
+
+    // Audit finding C4: register the broadcast tx so `getTransaction()`
+    // resolves it. Previously only `rawTransactions` + `knownOutpoints` were
+    // populated, so `getTransaction(txid)` threw "transaction not found" for
+    // a tx this provider had just acked. `RunarContract.deploy()` /
+    // `finalizeCall()` caught that and returned an empty-`inputs`/`outputs`
+    // shell, making every post-broadcast `result.tx.outputs` assertion in the
+    // suite vacuous. Unknown txids still throw — see `getTransaction`.
+    this.transactions.set(fakeTxid, txToTransactionData(fakeTxid, tx));
 
     // Register this tx's own outputs as known outpoints so a subsequent
     // chained call (spending the continuation this broadcast just created)

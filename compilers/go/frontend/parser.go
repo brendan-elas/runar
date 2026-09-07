@@ -48,6 +48,13 @@ func (r *ParseResult) ErrorStrings() []string {
 //   - .runar.zig -> ParseZig
 //   - .runar.java -> ParseJava
 //   - default -> Parse (existing TypeScript parser)
+// ackUnsoundSP1FriRE opts a contract in to the KNOWN-UNSOUND SP1 FRI verifier.
+// Scanned over the RAW SOURCE in ParseSource so every surface format honours it
+// identically — unlike @sighash / @embedAlways, which only the TypeScript
+// parser reads. See sp1_fri_soundness_warning.go for what is unsound and why
+// the default is a hard error.
+var ackUnsoundSP1FriRE = regexp.MustCompile(`@acknowledgeUnsoundSP1FriVerifier\b`)
+
 func ParseSource(source []byte, fileName string) *ParseResult {
 	// DoS-bound size guard. Reject oversized source BEFORE any
 	// format-specific parser touches the input. BUG-008 follow-up.
@@ -84,17 +91,17 @@ func ParseSource(source []byte, fileName string) *ParseResult {
 		if msg := unsupportedDirectiveError(source, "Move"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseMove(source, fileName)
+		return stampSP1FriAck(ParseMove(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.go"):
 		if msg := unsupportedDirectiveError(source, "Go DSL"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseGoContract(source, fileName)
+		return stampSP1FriAck(ParseGoContract(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.py"):
 		if msg := unsupportedDirectiveError(source, "Python"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParsePython(source, fileName)
+		return stampSP1FriAck(ParsePython(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.rs"):
 		if msg := unsupportedDirectiveError(source, "Rust"); msg != "" {
 			return directiveGuardResult(msg)
@@ -104,21 +111,31 @@ func ParseSource(source []byte, fileName string) *ParseResult {
 		if msg := unsupportedDirectiveError(source, "Ruby"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseRuby(source, fileName)
+		return stampSP1FriAck(ParseRuby(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.zig"):
 		if msg := unsupportedDirectiveError(source, "Zig"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseZig(source, fileName)
+		return stampSP1FriAck(ParseZig(source, fileName), source)
 	case strings.HasSuffix(lower, ".runar.java"):
 		if msg := unsupportedDirectiveError(source, "Java"); msg != "" {
 			return directiveGuardResult(msg)
 		}
-		return ParseJava(source, fileName)
+		return stampSP1FriAck(ParseJava(source, fileName), source)
 	default:
 		// TypeScript surface: honours @sighash / @embedAlways directly.
-		return Parse(source, fileName)
+		return stampSP1FriAck(Parse(source, fileName), source)
 	}
+}
+
+// stampSP1FriAck records whether the raw source carried the
+// @acknowledgeUnsoundSP1FriVerifier directive. Applied to the parse RESULT so
+// it is independent of which surface parser ran.
+func stampSP1FriAck(res *ParseResult, source []byte) *ParseResult {
+	if res != nil && res.Contract != nil && ackUnsoundSP1FriRE.Match(source) {
+		res.Contract.AckUnsoundSP1Fri = true
+	}
+	return res
 }
 
 // Directive markers for the fail-closed guard. Word-boundary anchored to
@@ -164,6 +181,25 @@ func Parse(source []byte, fileName string) *ParseResult {
 		fileName: fileName,
 	}
 
+	// tree-sitter is error-tolerant: malformed source still yields a tree, with
+	// the bad region marked ERROR/MISSING. Walking such a tree silently DROPS
+	// whatever failed to resolve (a statement parser returning nil is simply
+	// not appended), so `this.value = ;` used to compile to a script with the
+	// state write missing, and a malformed `assert(...)` to a script with the
+	// guard missing. Refuse the file instead — one check for every malformed
+	// shape, rather than a nil-guard per statement kind.
+	if root.HasError() {
+		if bad := firstBadNode(root); bad != nil {
+			p.addError(fmt.Sprintf(
+				"syntax error at line %d: unparseable %s near %q",
+				bad.StartPoint().Row+1, bad.Type(), p.snippet(bad),
+			))
+		} else {
+			p.addError("syntax error: source is not valid Rúnar")
+		}
+		return &ParseResult{Errors: p.errors}
+	}
+
 	contract := p.findContract(root)
 	if contract == nil {
 		p.addError("no class extending SmartContract, StatefulSmartContract, or UnsafeSmartContract found")
@@ -184,6 +220,37 @@ type parseContext struct {
 	source   []byte
 	fileName string
 	errors   []Diagnostic
+}
+
+// firstBadNode returns the first ERROR or MISSING node in the tree, so the
+// diagnostic can point at the offending line instead of the whole file.
+func firstBadNode(n *sitter.Node) *sitter.Node {
+	if n.IsError() || n.IsMissing() {
+		return n
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		if bad := firstBadNode(n.Child(i)); bad != nil {
+			return bad
+		}
+	}
+	return nil
+}
+
+// snippet renders a short, single-line excerpt of the node's source span for
+// the diagnostic message.
+func (p *parseContext) snippet(n *sitter.Node) string {
+	start, end := int(n.StartByte()), int(n.EndByte())
+	if start < 0 || end > len(p.source) || start >= end {
+		return ""
+	}
+	text := strings.TrimSpace(string(p.source[start:end]))
+	if idx := strings.IndexAny(text, "\r\n"); idx >= 0 {
+		text = text[:idx]
+	}
+	if len(text) > 40 {
+		text = text[:40] + "..."
+	}
+	return text
 }
 
 func (p *parseContext) addError(msg string) {

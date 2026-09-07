@@ -62,6 +62,27 @@ def is_empty_sig(value: object) -> bool:
     return isinstance(value, _EmptySig)
 
 
+def _is_likely_or_checksig(artifact) -> bool:
+    """True for OR-CHECKSIG (OP_BOOLOR+OP_CHECKSIG), false for OP_CHECKMULTISIG."""
+    asm = (getattr(artifact, 'asm', None) or '').upper()
+    if 'OP_CHECKMULTISIG' in asm:
+        return False
+    if 'OP_BOOLOR' in asm and 'OP_CHECKSIG' in asm:
+        return True
+    # NEW-014: `||` no longer lowers to OP_BOOLOR — it lowers to real
+    # OP_IF / OP_ELSE / OP_ENDIF control flow. The NULLFAIL hazard SURVIVES
+    # that change: when the FIRST branch fails, its OP_CHECKSIG has already
+    # run with a non-empty signature, which is exactly what BIP146 rejects.
+    # Short-circuiting only removes the hazard when the first branch succeeds,
+    # so this warning must still fire for the branch-shaped form.
+    if 'OP_IF' in asm and 'OP_CHECKSIG' in asm:
+        return True
+    script = (getattr(artifact, 'script', None) or getattr(artifact, 'script_hex', None) or '').lower()
+    if not asm and ('ae' in script or 'af' in script):
+        return False
+    return False
+
+
 #: The well-known ByteString parameter the SDK fills in with the transaction's
 #: concatenated outpoints (36 bytes per input) once the input list has
 #: converged. It is the ONLY ByteString slot for which a ``None`` call arg is a
@@ -585,13 +606,9 @@ class RunarContract:
             # None, so it is never added to `sig_indices` and never signed. It
             # stays in `resolved_args` and `_encode_arg` emits OP_0 for it.
 
-        # Soft heuristic (issue #106): more than one auto-signed Sig slot usually
-        # means an OR-CHECKSIG method whose non-matching branch should use
-        # EMPTY_SIG instead — otherwise every branch gets the same real signature
-        # and the failing CHECKSIG trips BIP146 NULLFAIL on broadcast. Legitimate
-        # AND-CHECKSIG multi-signer flows also use multiple auto slots, so this is
-        # informational only (the ABI does not encode OR-vs-AND topology).
-        if len(sig_indices) >= 2:
+        # Soft heuristic (issue #106): warn only for likely OR-CHECKSIG
+        # (OP_BOOLOR + OP_CHECKSIG), not genuine multi-sig (OP_CHECKMULTISIG).
+        if len(sig_indices) >= 2 and _is_likely_or_checksig(self.artifact):
             warnings.warn(
                 f"runar-sdk: {self.artifact.contract_name}.call('{method_name}') "
                 f"has {len(sig_indices)} auto-signed Sig slots. If this is an "
@@ -731,8 +748,23 @@ class RunarContract:
                     flat_ctor_args, ordered_outputs=ordered,
                 )
                 anf_ordered_outputs = ordered
-            except Exception:
-                computed, data_outs = None, []
+            except Exception as err:
+                # FAIL CLOSED (NEW-006). The legacy behaviour was to swallow
+                # this and build the continuation from the CURRENT (pre-call)
+                # state, which the covenant's hashOutputs binding then rejects
+                # -- a silent "your call cannot be broadcast", plus silent loss
+                # of the method's data / raw outputs. The interpreter is the
+                # only thing that knows this method's post-state and its
+                # addDataOutput/addRawOutput payloads, so there is nothing to
+                # fall back TO: an explicit `new_state` covers only the state
+                # field and still leaves the outputs missing.
+                raise RuntimeError(
+                    f"RunarContract.call('{method_name}'): the ANF interpreter "
+                    f"could not evaluate the method body, so the state "
+                    f"continuation and data outputs this call would commit "
+                    f"cannot be derived. Refusing to broadcast a transaction "
+                    f"built from the pre-call state. Cause: {err}"
+                ) from err
             if computed is not None:
                 merged = {**flat_state, **computed}
                 anf_computed_state = _regroup_fixed_array_state(

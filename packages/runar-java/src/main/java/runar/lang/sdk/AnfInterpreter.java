@@ -62,6 +62,14 @@ public final class AnfInterpreter {
         "_changePKH", "_changeAmount", "_newAmount", "txPreimage"
     );
 
+    /**
+     * The on-disk ANF spelling of a bigint literal: decimal digits with a
+     * trailing {@code n}. Unambiguous against a hex ByteString literal, which
+     * never contains {@code n}.
+     */
+    private static final java.util.regex.Pattern BIGINT_LITERAL =
+        java.util.regex.Pattern.compile("-?\\d+n");
+
     private static final Set<String> CHAIN_ONLY_KINDS = Set.of(
         "check_preimage", "deserialize_state", "get_state_script"
     );
@@ -694,7 +702,25 @@ public final class AnfInterpreter {
             case "load_const": {
                 Object v = value.get("value");
                 if (v instanceof String s && s.startsWith("@ref:")) {
-                    return env.get(s.substring(5));
+                    String target = s.substring(5);
+                    aliasScriptBytes(scriptBytes, target, bindingName);
+                    return env.get(target);
+                }
+                // On-disk ANF spells every bigint as a `"<decimal>n"` STRING
+                // (see `jsonWithBigInt` in runar-cli's compile command) — that
+                // is the artifact every SDK loads with a bare JSON parse.
+                // Decode it here so a const operand is a BigInteger, not a
+                // String: the byte-op paths below gate on
+                // `!(operand instanceof String)`, so leaving it a string
+                // silently routes `<< >> & | ^ ~` down the ByteString branch
+                // and the SDK builds a continuation the deployed script
+                // disagrees with (NEW-008). Go / Rust / Zig already decode
+                // this shape; this makes all seven agree with the script.
+                //
+                // Unambiguous: ANF ByteString literals are hex and `n` is not
+                // a hex digit, so `^-?\d+n$` cannot be a bytestring.
+                if (v instanceof String s && BIGINT_LITERAL.matcher(s).matches()) {
+                    return new BigInteger(s.substring(0, s.length() - 1));
                 }
                 return v;
             }
@@ -728,7 +754,10 @@ public final class AnfInterpreter {
                     if ("<<".equals(op) || ">>".equals(op)) {
                         // Shift count is read as a number on-chain — only `ab`'s
                         // length is significant, so the count operand's bytes
-                        // are never consulted.
+                        // are never consulted for length. But being read AS A
+                        // NUMBER means the count must be minimally encoded, or
+                        // the shift aborts.
+                        assertMinimalNumericOperand(scriptBytes, rightRef, right);
                         rb = scriptNumberShiftBytes(op, ab, toBigInt(right));
                     } else {
                         byte[] bb = scriptBytes.containsKey(rightRef)
@@ -738,6 +767,18 @@ public final class AnfInterpreter {
                     }
                     scriptBytes.put(bindingName, rb);
                     return MockCrypto.decodeScriptNumber(rb);
+                }
+                // Numeric consumers decode BOTH operands with fRequireMinimal,
+                // so a threaded non-minimal intermediate (e.g. the 1-byte
+                // [0x00] that `1 >> 1` leaves) aborts the script rather than
+                // silently re-minimising to 0. Byte-typed ops are exempt: they
+                // never carry threaded bytes and OP_CAT/OP_EQUAL impose no
+                // numeric decode.
+                boolean isBytesPath = "bytes".equals(resultType)
+                    || (left instanceof String && right instanceof String);
+                if (isNumericConsumerOp(op) && !isBytesPath) {
+                    assertMinimalNumericOperand(scriptBytes, leftRef, left);
+                    assertMinimalNumericOperand(scriptBytes, rightRef, right);
                 }
                 return evalBinOp(op, left, right, resultType);
             }
@@ -757,11 +798,27 @@ public final class AnfInterpreter {
                     scriptBytes.put(bindingName, rb);
                     return MockCrypto.decodeScriptNumber(rb);
                 }
+                // Every other unary op reads its operand as a script NUMBER
+                // (`-` -> OP_NEGATE) or coerces it to a boolean (`!` ->
+                // OP_NOT), both fRequireMinimal decodes. `~` never reaches here
+                // on the numeric path — it is a byte op and must keep accepting
+                // non-minimal bytes.
+                assertMinimalNumericOperand(scriptBytes, operandRef, operand);
                 return evalUnaryOp(op, operand, resultType);
             }
             case "call": {
                 String func = (String) value.get("func");
                 List<String> argNames = stringList(value.get("args"));
+                // The single funnel every numeric builtin (`abs`, `min`, `max`,
+                // `within`, `safediv`, `clamp`, `sign`, `bool`, ...) reads its
+                // operands through. Only a NUMERIC byte-op result ever carries
+                // threaded bytes, and a bigint argument is exactly what those
+                // builtins decode with fRequireMinimal on chain — a ByteString
+                // argument can never carry an entry here, so gating every
+                // argument costs nothing and cannot miss a builtin.
+                for (String n : argNames) {
+                    assertMinimalNumericOperand(scriptBytes, n, env.get(n));
+                }
                 List<Object> argVals = new ArrayList<>(argNames.size());
                 for (String n : argNames) argVals.add(env.get(n));
                 // Strict mode: a `call(assert, x)` lowering path enforces the
@@ -791,7 +848,9 @@ public final class AnfInterpreter {
                 evalBindings(anf, branch, childEnv, stateDelta, dataOutputs, rawOutputs, outputs, strict, realCrypto, witness, methodName, continuationTaint, scriptBytes);
                 env.putAll(childEnv);
                 if (!branch.isEmpty()) {
-                    return childEnv.get((String) branch.get(branch.size() - 1).get("name"));
+                    String lastName = (String) branch.get(branch.size() - 1).get("name");
+                    aliasScriptBytes(scriptBytes, lastName, bindingName);
+                    return childEnv.get(lastName);
                 }
                 return null;
             }
@@ -813,7 +872,9 @@ public final class AnfInterpreter {
                     evalBindings(anf, body, loopEnv, stateDelta, dataOutputs, rawOutputs, outputs, strict, realCrypto, witness, methodName, continuationTaint, scriptBytes);
                     env.putAll(loopEnv);
                     if (!body.isEmpty()) {
-                        lastVal = loopEnv.get((String) body.get(body.size() - 1).get("name"));
+                        String lastName = (String) body.get(body.size() - 1).get("name");
+                        aliasScriptBytes(scriptBytes, lastName, bindingName);
+                        lastVal = loopEnv.get(lastName);
                     }
                 }
                 return lastVal;
@@ -1060,6 +1121,34 @@ public final class AnfInterpreter {
     // BigInteger wrappers below re-encode operands to their minimal bytes and are
     // used by the single-op truth-table tests only.
 
+    /**
+     * Carry a binding's raw stack bytes across an ALIAS — a binding whose value
+     * IS another binding's slot: the {@code load_const "@ref:<name>"} every
+     * local rebind lowers to, an {@code if} adopting its taken arm's last
+     * value, a {@code loop} adopting its body's. Without this, a chained
+     * length-sensitive op re-minimises the aliased value and disagrees with the
+     * deployed script (NEW-006: {@code (4n ^ 4n)} is a 1-byte {@code 0x00} on
+     * the stack but empty when re-minimised from {@code 0n}).
+     *
+     * <p>Mirrors {@code aliasScriptBytes} in the TS SDK's anf-interpreter, and
+     * the {@code rawSlots} marker StackLower already carries across the same
+     * constructs.
+     *
+     * <p>CLEARS when the source has no entry: the alias target is then a
+     * freshly pushed, minimal value, so a stale entry left by an earlier
+     * binding of the SAME name ({@code let m0 = 4n ^ 4n; m0 = 300n;}) would
+     * otherwise be read as this slot's width — a silently wrong value rather
+     * than a throw.
+     */
+    private static void aliasScriptBytes(Map<String, byte[]> scriptBytes, String from, String to) {
+        byte[] bytes = scriptBytes.get(from);
+        if (bytes != null) {
+            scriptBytes.put(to, bytes);
+        } else {
+            scriptBytes.remove(to);
+        }
+    }
+
     /** OP_AND/OP_OR/OP_XOR on raw stack bytes. Aborts (throws) on a length
      *  mismatch, exactly like the on-chain opcodes. */
     static byte[] scriptNumberBitwiseBytes(String op, byte[] av, byte[] bv) {
@@ -1122,6 +1211,49 @@ public final class AnfInterpreter {
             num = num.shiftRight(8);
         }
         return result;
+    }
+
+    /**
+     * Whether a bin_op consumes its operands NUMERICALLY, i.e. lowers to an
+     * opcode that decodes them with {@code fRequireMinimal = true}:
+     * OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD, OP_NUMEQUAL(VERIFY)/OP_NUMNOTEQUAL and
+     * the relational ops. The byte-array ops {@code & | ^} and a shift's VALUE
+     * operand are deliberately absent — they take raw bytes and only require
+     * equal length. {@code &&}/{@code ||} cast to bool, which imposes no
+     * minimal-encoding requirement either.
+     */
+    private static boolean isNumericConsumerOp(String op) {
+        switch (op) {
+            case "+": case "-": case "*": case "/": case "%":
+            case "==": case "===": case "!=": case "!==":
+            case "<": case "<=": case ">": case ">=":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Abort if {@code ref}'s threaded stack bytes are a NON-minimal encoding of
+     * its decoded value — the exact case a numeric consumer rejects on chain
+     * ("non-minimally encoded script number"). Only byte-array ops thread bytes,
+     * so a ref absent from the side map is minimal by construction and passes.
+     *
+     * <p>Without this, {@code 1 >> 1} (which leaves the 1-byte {@code [0x00]},
+     * NOT the empty minimal zero) is re-minimised to {@code 0} by the numeric
+     * path: the interpreter reports a VALID spend for a script that aborts on
+     * chain, leaving the UTXO permanently unspendable.
+     */
+    private static void assertMinimalNumericOperand(
+        Map<String, byte[]> scriptBytes, String ref, Object val
+    ) {
+        byte[] raw = scriptBytes.get(ref);
+        if (raw == null) return;
+        if (!java.util.Arrays.equals(raw, MockCrypto.encodeScriptNumber(toBigInt(val)))) {
+            throw new InterpreterException(
+                "non-minimally encoded script number: operand '" + ref + "' occupies "
+                + raw.length + " stack byte(s) but decodes to " + toBigInt(val));
+        }
     }
 
     /** OP_AND/OP_OR/OP_XOR on two script-number-valued BigIntegers (minimal

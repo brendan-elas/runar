@@ -118,6 +118,43 @@ jobs:
         # rot into a no-op that greenlights everything.
         run: node conformance/scripts/check-golden-provenance.mjs --self-test
 
+  go-only-crypto-vectors:
+    # RESEARCH-VECTOR ORACLE GATE (v1 audit — Go-only crypto).
+    #
+    # BabyBear, KoalaBear, Poseidon2, BN254/Groth16, Merkle and the SP1 FRI
+    # verifier ship Stack-IR codegen in the GO TIER ONLY by project policy, so
+    # the repo's headline cross-tier parity invariant proves NOTHING about them:
+    # one implementation cannot disagree with itself. `tests/vectors/*.json` is
+    # their entire oracle. Two independent things are checked here.
+    #
+    # 1. Reproducibility. The vectors are derived from Plonky3 (p3-baby-bear,
+    #    p3-koala-bear, p3-poseidon2) and gnark-crypto, but "derived from
+    #    Plonky3" used to be a claim in a comment with nothing enforcing it. The
+    #    script re-runs every generator and fails if one byte of any checked-in
+    #    vector moves, so an upstream drift or a hand-edit is loud instead of
+    #    silent.
+    # 2. BN254 pairing invariants. The pairing is the most security-critical
+    #    operation in the Groth16 path and has no upstream KAT here, so the
+    #    corpus is checked algebraically instead — bilinearity classes, must-be-
+    #    identity vectors, negative controls, canonicity and a coverage floor.
+    name: Test — Go-only crypto research vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: BN254 pairing invariants (algebraic, no upstream KAT needed)
+        run: node conformance/scripts/check-bn254-pairing-invariants.mjs
+      - name: Self-test the invariant checker (both directions)
+        run: node conformance/scripts/check-bn254-pairing-invariants.mjs --self-test
+      - name: Vectors reproduce byte-for-byte from Plonky3 + gnark-crypto
+        run: tests/generate-vectors/verify-reproducible.sh
+
   wire-format-must-move-golden:
     # MUST-MOVE-A-GOLDEN GATE (testing-gap plan §0.1 reviewer #3 / §3 Phase F1,
     # finding TG-011). Complement of the golden-provenance gate above: that one
@@ -354,6 +391,12 @@ jobs:
         run: cd compilers/rust && cargo build --release
       - name: Warm Go build cache (for cross-compiler tests)
         run: cd compilers/go && go build ./...
+      - name: Build Go compiler binary (for the 7-tier validation-parity tests)
+        # `go build ./...` warms the cache but emits no binary. The NEW-002 /
+        # NEW-001 parity suites spawn each tier's CLI and FAIL rather than skip
+        # when one is absent — that is deliberate, so the seven-tier claim
+        # cannot pass vacuously — which means the binary has to exist here.
+        run: cd compilers/go && go build -o runar-go .
       - name: Build Zig compiler (for cross-compiler tests)
         run: cd compilers/zig && zig build -Doptimize=ReleaseSafe
       - name: Build Java compiler jar (for cross-compiler tests)
@@ -783,6 +826,15 @@ jobs:
         env:
           JAVA_JAR: ${{ steps.java-jar.outputs.path }}
         run: conformance/node_modules/.bin/tsx conformance/runner/index.ts --tests-dir conformance/tests --parser-only
+      - name: Cross-tier rejection parity (programs that must NOT compile)
+        # The parser-only step above proves every tier ACCEPTS what it should.
+        # Nothing proved they agree on what to REFUSE, and that gap let a Go
+        # statement-drop reach RC: malformed input was silently discarded and
+        # the tier emitted a locking script the other six rejected. This runs
+        # the negative corpus against every built tier.
+        env:
+          JAVA_JAR: ${{ steps.java-jar.outputs.path }}
+        run: cd conformance && npx vitest run negatives/
       - name: Run multi-format source conformance (all 7 compilers, all 9 formats)
         # Adds the TypeScript compiler to the central conformance job (it was
         # previously absent) and exercises every compiler's frontend against

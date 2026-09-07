@@ -303,6 +303,48 @@ impl StackMap {
         self.slots.iter().filter(|s| !s.is_empty()).cloned().collect()
     }
 
+    /// How many slots carry each name. The model resolves a name to its
+    /// SHALLOWEST slot, so a name held more than once has one live slot and the
+    /// rest are dead residue — but they are all still "the name" to a
+    /// set-membership test, which is what NEW-018 turned on. See `lower_if`.
+    fn name_counts(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for s in &self.slots {
+            if !s.is_empty() {
+                *counts.entry(s.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// The depths to drop for a multiset of names, taking the SHALLOWEST
+    /// occurrences of a name listed more than once — the shallowest slot is the
+    /// live one, and it is the one the sibling arm consumed. Returned
+    /// deepest-first so removing a deeper slot does not shift a shallower one.
+    /// For a name listed once this is exactly `find_depth`, which also resolves
+    /// to the shallowest slot.
+    fn drop_depths_for(&self, names: &[String]) -> Vec<usize> {
+        let mut need: HashMap<&str, usize> = HashMap::new();
+        for n in names {
+            *need.entry(n.as_str()).or_insert(0) += 1;
+        }
+        let mut depths: Vec<usize> = Vec::with_capacity(names.len());
+        for d in 0..self.depth() {
+            let name = self.peek_at_depth(d);
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(want) = need.get_mut(name) {
+                if *want > 0 {
+                    depths.push(d);
+                    *want -= 1;
+                }
+            }
+        }
+        depths.sort_by(|a, b| b.cmp(a));
+        depths
+    }
+
     /// Debug string of the slot names (bottom -> top) for error messages.
     fn debug_slots(&self) -> String {
         self.slots.join(", ")
@@ -2009,7 +2051,32 @@ impl LoweringContext {
             }
         }
 
-        let is_last = self.is_last_use(cond, binding_index, last_uses);
+        // NEW-015: does an ARM read the condition again?
+        //
+        // `last_uses` is keyed by the index of the ENCLOSING binding, and
+        // `collect_refs` deliberately recurses into `then` / `else` so an
+        // arm-only ref is not dropped early. Both facts together mean an arm's
+        // read of the condition lands on THIS binding's index —
+        // indistinguishable from a ref used only as the condition.
+        // `is_last_use` then said "yes, consume it", `bring_to_top` ROLLed the
+        // slot away, and the arm looked for a value that was no longer there:
+        //
+        //     let f: boolean = c > 0n;
+        //     assert(f ? c > 10n : !f);
+        //     //  Value 'f' not found on stack (stack has 1 items: [c])
+        //
+        // Legal source, accepted by validate and typecheck, rejected here — so
+        // there was no diagnostic a developer could act on. It only ever bit
+        // when the condition local was DEAD after the `if`; one that stayed
+        // live was already covered by the `last_idx > binding_index` rule
+        // below, which is why the shape looked like it worked. `&&` / `||`
+        // desugar to this node, so `f || !f` routes through the same path.
+        let cond_read_in_arms = then_bindings
+            .iter()
+            .chain(else_bindings.iter())
+            .any(|b| collect_refs(&b.value).iter().any(|r| r == cond));
+
+        let is_last = !cond_read_in_arms && self.is_last_use(cond, binding_index, last_uses);
         self.bring_to_top(cond, is_last);
         self.sm.pop(); // OP_IF consumes condition
 
@@ -2019,6 +2086,15 @@ impl LoweringContext {
             if last_idx > binding_index && self.sm.has(ref_name) {
                 protected_refs.insert(ref_name.clone());
             }
+        }
+
+        // A condition the arms re-read was PICKed just above, so the slot
+        // survived OP_IF. Protect it for the same reason the merged-local block
+        // below is protected: only ONE arm may hold the read, so letting that
+        // arm consume the slot would leave the two arms at different depths
+        // over a name the parent still models.
+        if cond_read_in_arms && self.sm.has(cond) {
+            protected_refs.insert(cond.to_string());
         }
 
         // The K>=2 merged-local block reads every merged local in BOTH arms,
@@ -2109,29 +2185,76 @@ impl LoweringContext {
         // OP_CAT with empty bytes is identity (no-op for output hashing).
         // Identify items consumed asymmetrically between branches.
         // Phase 1: collect consumed names from both directions.
-        let post_then_names = then_ctx.sm.named_slots();
+        //
+        // NEW-018: counted by MULTIPLICITY, not by name-set membership.
+        //
+        // A parent stack legitimately holds the same name in more than one slot
+        // — a loop rebinding a local leaves one slot per unrolled iteration, all
+        // named `acc`, of which only the shallowest is ever read (the model
+        // resolves a name to its shallowest slot). When an arm ROLLs that live
+        // slot away, the name is STILL in the arm's name SET because the dead
+        // residue slot beneath it carries the same name — so the set-difference
+        // this phase used to compute saw nothing consumed, emitted no matching
+        // drop in the sibling, and left the two arms one slot apart.
+        //
+        // Phase 3 then "fixed" the depth with an anonymous pad. A pad restores
+        // the COUNT but not the POSITION: the arm that lost a slot from the
+        // middle of the region gets a placeholder next to its result, while the
+        // sibling still holds the real value in the original slot. The two arms
+        // leave positionally different stacks, the parent adopts one of them,
+        // and every slot the other arm holds below the result is off by one:
+        //
+        //     let acc = p; let wacc = 0n;
+        //     for (…) for (…) { acc = acc + p; wacc = wacc + acc; }
+        //     let br0 = 0n; const sib0 = p;
+        //     if (p === 0n) { br0 = p; }
+        //     assert((p >= 0n ? acc >= 0n : false) ? (br0 < sib0) : false);
+        //
+        // The inner conditional is the CONDITION of the outer one. Its then-arm
+        // consumes the live `acc`; the parent holds `acc` twice, so phase 1
+        // missed it and the arms came back as `[t · br0 sib0 …]` against
+        // `[t br0 sib0 acc …]`. With p = 1 the source ACCEPTS and the AST
+        // interpreter accepts; the script engines reject the spend with "The top
+        // stack element must be truthy after script evaluation" — an ordinary
+        // contract deployed to a permanently unspendable UTXO. It needs no `&&`:
+        // a plain nested ternary reaches it, and `a && b && c` is
+        // left-associative, so it is also what blocked the short-circuit
+        // desugar.
+        //
+        // Counting occurrences instead makes the sibling drop its matching slot,
+        // both arms end at the same depth with the same layout, and no pad is
+        // needed at all. Byte-neutral for every parent stack with no duplicated
+        // name: for a name held once, "parent has 1, arm has 0" is exactly the
+        // old `!post_then_names.contains(name)`, and the drop depths are the
+        // same list.
+        let pre_if_counts = self.sm.name_counts();
+        let then_counts = then_ctx.sm.name_counts();
+        let else_counts = else_ctx.sm.name_counts();
         let mut consumed_names: Vec<String> = Vec::new();
-        for name in &pre_if_names {
-            if !post_then_names.contains(name) && else_ctx.sm.has(name) {
-                consumed_names.push(name.clone());
-            }
-        }
-        let post_else_names = else_ctx.sm.named_slots();
         let mut else_consumed_names: Vec<String> = Vec::new();
-        for name in &pre_if_names {
-            if !post_else_names.contains(name) && then_ctx.sm.has(name) {
-                else_consumed_names.push(name.clone());
+        // Iterate the parent's slots, not the count map, so the result order is
+        // deterministic — `HashMap` iteration order is not.
+        let mut seen: HashSet<&str> = HashSet::new();
+        for i in 0..self.sm.depth() {
+            let name = self.sm.peek_at_depth(i);
+            if name.is_empty() || !seen.insert(name) {
+                continue;
+            }
+            let held = *pre_if_counts.get(name).unwrap_or(&0);
+            let then_lost = held.saturating_sub(*then_counts.get(name).unwrap_or(&0));
+            let else_lost = held.saturating_sub(*else_counts.get(name).unwrap_or(&0));
+            for _ in 0..then_lost.saturating_sub(else_lost) {
+                consumed_names.push(name.to_string());
+            }
+            for _ in 0..else_lost.saturating_sub(then_lost) {
+                else_consumed_names.push(name.to_string());
             }
         }
 
         // Phase 2: perform ALL drops before any placeholder pushes.
         // This prevents double-placeholder when bilateral drops balance each other.
         if !consumed_names.is_empty() {
-            let mut depths: Vec<usize> = consumed_names
-                .iter()
-                .map(|n| else_ctx.sm.find_depth(n).unwrap())
-                .collect();
-            depths.sort_by(|a, b| b.cmp(a));
+            let depths: Vec<usize> = else_ctx.sm.drop_depths_for(&consumed_names);
             for depth in depths {
                 if depth == 0 {
                     else_ctx.emit_op(StackOp::Drop);
@@ -2152,11 +2275,7 @@ impl LoweringContext {
             }
         }
         if !else_consumed_names.is_empty() {
-            let mut depths: Vec<usize> = else_consumed_names
-                .iter()
-                .map(|n| then_ctx.sm.find_depth(n).unwrap())
-                .collect();
-            depths.sort_by(|a, b| b.cmp(a));
+            let depths: Vec<usize> = then_ctx.sm.drop_depths_for(&else_consumed_names);
             for depth in depths {
                 if depth == 0 {
                     then_ctx.emit_op(StackOp::Drop);
@@ -2190,13 +2309,19 @@ impl LoweringContext {
         //
         // Runs AFTER the phase-2 consumption drops, so both arms have given up
         // the same parent slots and share one base depth.
+        //
+        // NEW-018: counted by MULTIPLICITY, for the same reason phase 1 is.
+        // Phase 1 now makes both arms give up the same slot of a name the parent
+        // holds twice, so the base depth has to count that slot as given up too
+        // — otherwise `target_depth` is one too high, the trim below does
+        // nothing, and the layout assertion fires on a well-formed program.
         let n_declared = results.len();
         if n_declared >= 1 {
-            let still_held = then_ctx.sm.named_slots();
-            let consumed_from_parent = pre_if_names
+            let still_held_counts = then_ctx.sm.name_counts();
+            let consumed_from_parent: usize = pre_if_counts
                 .iter()
-                .filter(|name| !still_held.contains(*name) && self.sm.has(name))
-                .count();
+                .map(|(name, held)| held.saturating_sub(*still_held_counts.get(name).unwrap_or(&0)))
+                .sum();
             let target_depth = self.sm.depth() - consumed_from_parent + n_declared;
             for arm_ctx in [&mut then_ctx, &mut else_ctx] {
                 while arm_ctx.sm.depth() > target_depth {
@@ -2277,6 +2402,10 @@ impl LoweringContext {
             );
         }
 
+        // NEW-018 needs the arms' post-branch name MULTISET. Snapshotted here
+        // because the arms' op lists are consumed immediately after this point.
+        let post_branch_counts = then_ctx.sm.name_counts();
+
         let then_ops = then_ctx.ops;
         let else_ops = else_ctx.ops;
 
@@ -2298,12 +2427,19 @@ impl LoweringContext {
         let mut post_endif_drops = 0usize;
 
         // Reconcile parent stackMap: remove items consumed by the branches.
-        let post_branch_names = then_ctx.sm.named_slots();
-        for name in &pre_if_names {
-            if !post_branch_names.contains(name) && self.sm.has(name) {
+        //
+        // NEW-018: counted by MULTIPLICITY, for the same reason phase 1 is. When
+        // the arms consume the live slot of a name the parent holds twice, the
+        // parent must give up one slot too — the set test kept both, so the
+        // parent modelled one more slot than the arms physically left and the
+        // adopt below saw `arm_depth == parent_depth` and pushed nothing at all.
+        for (name, held) in &pre_if_counts {
+            let mut excess = held.saturating_sub(*post_branch_counts.get(name).unwrap_or(&0));
+            while excess > 0 && self.sm.has(name) {
                 if let Some(depth) = self.sm.find_depth(name) {
                     self.sm.remove_at_depth(depth);
                 }
+                excess -= 1;
             }
         }
 
@@ -2347,6 +2483,16 @@ impl LoweringContext {
             for name in results {
                 self.sm.push(name);
             }
+            // How far below the result block the deepest stale slot sat.
+            // Adopting a result puts it ON TOP, but its pre-`if` binding lived
+            // at depth `d`, i.e. BENEATH the `d - n_declared` slots in between.
+            // Removing the stale copy does not reorder those in-between slots,
+            // so after the loop the adopted result has crossed them: the layout
+            // is rotated even though the NAME SET and the DEPTH are both
+            // unchanged. That is invisible to the reconcile's name-set check and
+            // to the depth check below, and it is the whole of issue #149 — see
+            // `sink_below` below.
+            let mut sink_below = 0usize;
             for i in (0..n_declared).rev() {
                 let name = &results[i];
                 let mut d = n_declared;
@@ -2361,9 +2507,42 @@ impl LoweringContext {
                         self.emit_op(StackOp::Drop);
                         self.sm.pop();
                         post_endif_drops += 1;
+                        if d - n_declared > sink_below {
+                            sink_below = d - n_declared;
+                        }
                         break;
                     }
                     d += 1;
+                }
+            }
+
+            // Restore the inherited layout: sink the whole result block back
+            // under the `sink_below` slots it just crossed, so BOTH paths of the
+            // enclosing `if` leave the same slot order and every post-OP_ENDIF
+            // read resolves against the layout it was generated for. Rolling the
+            // deepest item of the (n_declared + sink_below) window to the top,
+            // `sink_below` times, lifts those slots back above the results while
+            // preserving their own relative order.
+            // Applied unconditionally, NOT gated on this `if`'s own else. The
+            // asymmetry that makes #149 unspendable belongs to the ENCLOSING
+            // `if` (whose fall-through path keeps the pre-`if` layout), and
+            // `lower_if` has no view of its parent here. Gating on
+            // `else_bindings.is_empty()` was measured and is WRONG: the #149
+            // inner `if` has a real else, so the gate disables the repair
+            // exactly where it is needed. Restoring the pre-`if` order
+            // unconditionally keeps the parent's own model — names at the depths
+            // it recorded before the branch — true on every path.
+            if sink_below > 0 {
+                let window_size = n_declared + sink_below;
+                for _ in 0..sink_below {
+                    self.emit_op(StackOp::Push(PushValue::Int(BigInt::from(
+                        (window_size - 1) as i128,
+                    ))));
+                    self.sm.push("");
+                    self.emit_op(StackOp::Roll { depth: window_size });
+                    self.sm.pop();
+                    let lifted = self.sm.remove_at_depth(window_size - 1);
+                    self.sm.push(&lifted);
                 }
             }
         } else if then_ctx.sm.depth() > self.sm.depth()

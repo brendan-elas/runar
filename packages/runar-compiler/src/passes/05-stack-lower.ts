@@ -2147,8 +2147,32 @@ class LoweringContext {
       );
     }
 
+    // NEW-015: does an ARM read the condition again?
+    //
+    // `lastUses` is keyed by the index of the ENCLOSING binding, and
+    // `collectRefs` deliberately recurses into `then` / `else` so an arm-only
+    // ref is not dropped early. Both facts together mean an arm's read of the
+    // condition lands on THIS binding's index — indistinguishable from a ref
+    // used only as the condition. `isLastUse` then said "yes, consume it",
+    // `bringToTop` ROLLed the slot away, and the arm looked for a value that
+    // was no longer there:
+    //
+    //     let f: boolean = c > 0n;
+    //     assert(f ? c > 10n : !f);
+    //     //  Value 'f' not found on stack (stack has 1 items: [c])
+    //
+    // Legal source, accepted by 02-validate and 03-typecheck, rejected here —
+    // so there was no diagnostic a developer could act on. It only ever bit
+    // when the condition local was DEAD after the `if`; one that stayed live
+    // was already covered by the `lastIdx > bindingIndex` rule below, which is
+    // why the shape looked like it worked. `&&` / `||` desugar to this node,
+    // so `f || !f` routes through the same path.
+    const condReadInArms =
+      thenBindings.some(b => collectRefs(b.value).includes(cond)) ||
+      elseBindings.some(b => collectRefs(b.value).includes(cond));
+
     // Get condition to top of stack
-    const isLast = this.isLastUse(cond, bindingIndex, lastUses);
+    const isLast = !condReadInArms && this.isLastUse(cond, bindingIndex, lastUses);
     this.bringToTop(cond, isLast);
     this.stackMap.pop(); // OP_IF consumes the condition
 
@@ -2160,6 +2184,13 @@ class LoweringContext {
         protectedRefs.add(ref);
       }
     }
+
+    // A condition the arms re-read was PICKed just above, so the slot survived
+    // OP_IF. Protect it for the same reason the merged-local block below is
+    // protected: only ONE arm may hold the read, so letting that arm consume
+    // the slot would leave the two arms at different depths over a name the
+    // parent still models.
+    if (condReadInArms && this.stackMap.has(cond)) protectedRefs.add(cond);
 
     // The K>=2 merged-local block reads every merged local in BOTH arms, and
     // that read is RECONCILIATION, not a use: it is what makes each arm leave
@@ -2209,6 +2240,24 @@ class LoweringContext {
 
     thenCtx.drainBranchPrivateResidue(preIfNames);
 
+    // COVERAGE (measured 2026-08-17, v1 audit remediation — finding CC-016):
+    // this guard did not fire ONCE across all 71 conformance fixtures, nine
+    // hand-designed terminal-`if` shapes (stateless and stateful, multi-local
+    // arms, property writes, multiple asserts per arm), 1200 `--tri-modal`
+    // property runs, and 400 `--spend-oracle` cases. Instrumented with a
+    // `console.error` in the body and counted; every count was 0.
+    //
+    // So a mechanical mutant here (`- 1` -> `+ 1`, which would emit two extra
+    // OP_NIPs) survives the entire net — but as an EQUIVALENT mutant over dead
+    // code, NOT as a coverage hole in a reachable path. Those are different
+    // findings and the distinction matters for the mutation score.
+    //
+    // Deliberately NOT deleted. "I could not reach it" is not "it is provably
+    // unreachable", and removing a defensive cleanup from `lowerIf` — the
+    // function that carried issue #149 — on that evidence is not a trade worth
+    // making before v1. If someone can show the arm can exit at depth > 1 under
+    // a terminal assert, this needs a fixture; if it is provably unreachable,
+    // it should go, and the mutation corpus should stop counting it.
     if (terminalAssert && thenCtx.stackMap.depth > 1) {
       const excess = thenCtx.stackMap.depth - 1;
       for (let i = 0; i < excess; i++) {
@@ -2246,25 +2295,89 @@ class LoweringContext {
     // OP_CAT with empty bytes is identity (no-op for output hashing).
     // Identify items consumed asymmetrically between branches.
     // Phase 1: collect consumed names from both directions.
-    const postThenNames = thenCtx.stackMap.namedSlots();
+    //
+    // NEW-018: counted by MULTIPLICITY, not by name-set membership.
+    //
+    // A parent stack legitimately holds the same name in more than one slot —
+    // a loop rebinding a local leaves one slot per unrolled iteration, all
+    // named `acc`, of which only the shallowest is ever read (the model
+    // resolves a name to its shallowest slot). When an arm ROLLs that live
+    // slot away, the name is STILL in the arm's name SET because the dead
+    // residue slot beneath it carries the same name — so the set-difference
+    // this phase used to compute saw nothing consumed, emitted no matching
+    // drop in the sibling, and left the two arms one slot apart.
+    //
+    // Phase 3 then "fixed" the depth with an anonymous pad. A pad restores the
+    // COUNT but not the POSITION: the arm that lost a slot from the middle of
+    // the region gets a placeholder next to its result, while the sibling
+    // still holds the real value in the original slot. The two arms leave
+    // positionally different stacks, the parent adopts one of them, and every
+    // slot the other arm holds below the result is off by one:
+    //
+    //     let acc = p; let wacc = 0n;
+    //     for (…) for (…) { acc = acc + p; wacc = wacc + acc; }
+    //     let br0 = 0n; const sib0 = p;
+    //     if (p === 0n) { br0 = p; }
+    //     assert((p >= 0n ? acc >= 0n : false) ? (br0 < sib0) : false);
+    //
+    // The inner conditional is the CONDITION of the outer one. Its then-arm
+    // consumes the live `acc`; the parent holds `acc` twice, so phase 1 missed
+    // it and the arms came back as `[t · br0 sib0 …]` against
+    // `[t br0 sib0 acc …]`. With p = 1 the source ACCEPTS and `TestContract`
+    // accepts; `ScriptVM` and `@bsv/sdk`'s `Spend` reject the spend with "The
+    // top stack element must be truthy after script evaluation" — an ordinary
+    // contract deployed to a permanently unspendable UTXO.
+    //
+    // Counting occurrences instead makes the sibling drop its matching slot,
+    // both arms end at the same depth with the same layout, and no pad is
+    // needed at all. Byte-neutral for every parent stack with no duplicated
+    // name: for a name held once, "parent has 1, arm has 0" is exactly the
+    // old `!postThenNames.has(name)`, and the drop depths are the same list.
+    const countNames = (m: StackMap): Map<string, number> => {
+      const counts = new Map<string, number>();
+      for (let d = 0; d < m.depth; d++) {
+        const n = m.peekAtDepth(d);
+        if (n !== null) counts.set(n, (counts.get(n) ?? 0) + 1);
+      }
+      return counts;
+    };
+    const preIfCounts = countNames(this.stackMap);
+    const thenCounts = countNames(thenCtx.stackMap);
+    const elseCounts = countNames(elseCtx.stackMap);
     const consumedNames: string[] = [];
-    for (const name of preIfNames) {
-      if (!postThenNames.has(name) && elseCtx.stackMap.has(name)) {
-        consumedNames.push(name);
-      }
-    }
-    const postElseNames = elseCtx.stackMap.namedSlots();
     const elseConsumedNames: string[] = [];
-    for (const name of preIfNames) {
-      if (!postElseNames.has(name) && thenCtx.stackMap.has(name)) {
-        elseConsumedNames.push(name);
-      }
+    for (const [name, held] of preIfCounts) {
+      const thenLost = Math.max(0, held - (thenCounts.get(name) ?? 0));
+      const elseLost = Math.max(0, held - (elseCounts.get(name) ?? 0));
+      for (let i = 0; i < thenLost - elseLost; i++) consumedNames.push(name);
+      for (let i = 0; i < elseLost - thenLost; i++) elseConsumedNames.push(name);
     }
+
+    // The depths to drop, shallowest occurrences first for a name listed more
+    // than once — the shallowest slot is the live one, and it is the one the
+    // sibling arm consumed. Returned deepest-first so removing a deeper slot
+    // does not shift a shallower one. For a name listed once this is exactly
+    // `findDepth`, which also resolves to the shallowest slot.
+    const dropDepthsFor = (m: StackMap, names: string[]): number[] => {
+      const need = new Map<string, number>();
+      for (const n of names) need.set(n, (need.get(n) ?? 0) + 1);
+      const depths: number[] = [];
+      for (let d = 0; d < m.depth; d++) {
+        const n = m.peekAtDepth(d);
+        if (n === null) continue;
+        const want = need.get(n) ?? 0;
+        if (want > 0) {
+          depths.push(d);
+          need.set(n, want - 1);
+        }
+      }
+      return depths.sort((a, b) => b - a);
+    };
 
     // Phase 2: perform ALL drops before any placeholder pushes.
     // This prevents double-placeholder when bilateral drops balance each other.
     if (consumedNames.length > 0) {
-      const depths = consumedNames.map(n => elseCtx.stackMap.findDepth(n)).sort((a, b) => b - a);
+      const depths = dropDepthsFor(elseCtx.stackMap, consumedNames);
       for (const depth of depths) {
         if (depth === 0) {
           elseCtx.emitOp({ op: 'drop' });
@@ -2285,7 +2398,7 @@ class LoweringContext {
       }
     }
     if (elseConsumedNames.length > 0) {
-      const depths = elseConsumedNames.map(n => thenCtx.stackMap.findDepth(n)).sort((a, b) => b - a);
+      const depths = dropDepthsFor(thenCtx.stackMap, elseConsumedNames);
       for (const depth of depths) {
         if (depth === 0) {
           thenCtx.emitOp({ op: 'drop' });
@@ -2325,10 +2438,17 @@ class LoweringContext {
     // no later use for it), which is the shape the filed reproducer hits.
     const nDeclared = results.length;
     if (nDeclared >= 1) {
-      const stillHeld = thenCtx.stackMap.namedSlots();
+      // NEW-018: counted by MULTIPLICITY, for the same reason phase 1 is. Phase 1
+      // now makes both arms give up the same slot of a name the parent holds
+      // twice, so the base depth has to count that slot as given up too —
+      // otherwise `targetDepth` is one too high, the trim below does nothing, and
+      // the layout assertion fires on a program that is actually well-formed.
+      // Byte-neutral for a name the parent holds once, where "held 1, arm holds
+      // 0" is exactly the old `!stillHeld.has(name)`.
+      const stillHeldCounts = countNames(thenCtx.stackMap);
       let consumedFromParent = 0;
-      for (const name of preIfNames) {
-        if (!stillHeld.has(name) && this.stackMap.has(name)) consumedFromParent++;
+      for (const [name, held] of preIfCounts) {
+        consumedFromParent += Math.max(0, held - (stillHeldCounts.get(name) ?? 0));
       }
       const targetDepth = this.stackMap.depth - consumedFromParent + nDeclared;
       for (const ctx of [thenCtx, elseCtx]) {
@@ -2441,11 +2561,20 @@ class LoweringContext {
 
     // Reconcile parent stackMap: remove items consumed by the branches.
     // Use thenCtx as the reference (both branches must consume the same items).
-    const postBranchNames = thenCtx.stackMap.namedSlots();
-    for (const name of preIfNames) {
-      if (!postBranchNames.has(name) && this.stackMap.has(name)) {
-        const depth = this.stackMap.findDepth(name);
-        this.stackMap.removeAtDepth(depth);
+    //
+    // NEW-018: counted by MULTIPLICITY, for the same reason phase 1 is. When
+    // the arms consume the live slot of a name the parent holds twice, the
+    // parent must give up one slot too — the set test kept both, so the parent
+    // modelled one more slot than the arms physically left and the adopt below
+    // saw `armDepth === parentDepth` and pushed nothing at all. Byte-neutral
+    // for a name the parent holds once: "held 1, arm holds 0" is exactly the
+    // old `!postBranchNames.has(name)`, and it removes the same single slot.
+    const postBranchCounts = countNames(thenCtx.stackMap);
+    for (const [name, held] of preIfCounts) {
+      let excess = held - (postBranchCounts.get(name) ?? 0);
+      while (excess > 0 && this.stackMap.has(name)) {
+        this.stackMap.removeAtDepth(this.stackMap.findDepth(name));
+        excess--;
       }
     }
 
@@ -2495,6 +2624,15 @@ class LoweringContext {
       for (const name of results) {
         this.stackMap.push(name);
       }
+      // How far below the result block the deepest stale slot sat. Adopting a
+      // result puts it ON TOP, but its pre-`if` binding lived at depth `d`,
+      // i.e. BENEATH the `d - nDeclared` slots in between. Removing the stale
+      // copy does not reorder those in-between slots, so after the loop the
+      // adopted result has crossed them: the layout is rotated even though the
+      // NAME SET and the DEPTH are both unchanged. That is invisible to the
+      // reconcile's name-set check and to Layer C's depth check, and it is the
+      // whole of issue #149 — see `sinkBelow` below.
+      let sinkBelow = 0;
       for (let i = nDeclared - 1; i >= 0; i--) {
         const name = results[i]!;
         for (let d = nDeclared; d < this.stackMap.depth; d++) {
@@ -2508,8 +2646,36 @@ class LoweringContext {
             this.emitOp({ op: 'drop' });
             this.stackMap.pop();
             postEndifDrops++;
+            if (d - nDeclared > sinkBelow) sinkBelow = d - nDeclared;
             break;
           }
+        }
+      }
+
+      // Restore the inherited layout: sink the whole result block back under
+      // the `sinkBelow` slots it just crossed, so BOTH paths of the enclosing
+      // `if` leave the same slot order and every post-OP_ENDIF read resolves
+      // against the layout it was generated for. Rolling the deepest item of
+      // the (nDeclared + sinkBelow) window to the top, `sinkBelow` times,
+      // lifts those slots back above the results while preserving their own
+      // relative order.
+      // Applied unconditionally, NOT gated on this `if`'s own else. The
+      // asymmetry that makes #149 unspendable belongs to the ENCLOSING `if`
+      // (whose fall-through path keeps the pre-`if` layout), and `lowerIf` has
+      // no view of its parent here. Gating on `elseBindings.length === 0` was
+      // measured and is WRONG: the #149 inner `if` has a real else, so the gate
+      // disables the repair exactly where it is needed. Restoring the pre-`if`
+      // order unconditionally keeps the parent's own model — names at the
+      // depths it recorded before the branch — true on every path.
+      if (sinkBelow > 0) {
+        const windowSize = nDeclared + sinkBelow;
+        for (let j = 0; j < sinkBelow; j++) {
+          this.emitOp({ op: 'push', value: BigInt(windowSize - 1) });
+          this.stackMap.push(null);
+          this.emitOp({ op: 'roll', depth: windowSize });
+          this.stackMap.pop();
+          const lifted = this.stackMap.removeAtDepth(windowSize - 1);
+          this.stackMap.push(lifted);
         }
       }
     } else if (thenCtx.stackMap.depth > this.stackMap.depth &&

@@ -101,6 +101,27 @@ module RunarCompiler
               loc: prop.source_location
             )
           end
+
+          # Validate initializer if present. FixedArray properties accept an
+          # array literal of literal elements (recursively, for nested
+          # arrays); other properties accept a plain literal value. Mirrors
+          # the TS validator in `02-validate.ts` and the Go peer in
+          # `validator.go`.
+          next if prop.initializer.nil?
+
+          if prop.type.is_a?(FixedArrayType)
+            unless array_literal_of_literals?(prop.initializer)
+              add_error(
+                "property '#{prop.name}' initializer must be an array literal of literal values",
+                loc: prop.source_location
+              )
+            end
+          elsif !literal_expression?(prop.initializer)
+            add_error(
+              "property '#{prop.name}' initializer must be a literal value",
+              loc: prop.source_location
+            )
+          end
         end
 
         # SmartContract (and the asm-escape-hatch UnsafeSmartContract) require
@@ -173,6 +194,141 @@ module RunarCompiler
 
         # Validate constructor body
         ctor.body.each { |stmt| validate_statement(stmt) }
+
+        validate_constructor_slot_bijection
+      end
+
+      # Enforce the NEW-002 invariant: every constructor parameter initialises
+      # exactly one property that needs a deploy-time value, and the i-th
+      # parameter initialises the i-th such property.
+      #
+      # A property's deploy-time value comes from a constructor ARGUMENT, and
+      # the artifact addresses those arguments POSITIONALLY: the ABI
+      # constructor params come from the constructor SIGNATURE while a
+      # constructor slot's paramIndex is an index into the properties with no
+      # initial_value, and the SDK splices constructorArgs[slot.paramIndex]
+      # into the slot's bytes. Two independently built lists, assumed to line
+      # up. Where they disagree a deploy argument lands in ANOTHER property's
+      # slot, silently -- a deployed contract authorising a value the developer
+      # never passed for that property.
+      #
+      # "Needs a deploy-time value" mirrors _constructor_assigned_properties in
+      # anf_lower.rb exactly: a property carries a compile-time initial_value
+      # iff it has an initializer the constructor does NOT override by
+      # assigning it a bare parameter.
+      def validate_constructor_slot_bijection
+        ctor = @contract.constructor
+        param_index = {}
+        ctor.params.each_with_index { |p, i| param_index[p.name] = i }
+
+        # property -> distinct bare parameters assigned to it; a property with
+        # any non-parameter assignment is recorded with an EMPTY list.
+        prop_to_params = {}
+        param_to_props = {}
+        ctor.body.each do |stmt|
+          next unless stmt.is_a?(AssignmentStmt)
+          next unless stmt.target.is_a?(PropertyAccessExpr)
+
+          prop = stmt.target.property
+          value = stmt.value
+          unless value.is_a?(Identifier) && param_index.key?(value.name)
+            prop_to_params[prop] = []
+            next
+          end
+          (prop_to_params[prop] ||= []) << value.name
+          (param_to_props[value.name] ||= []) << prop
+        end
+
+        before = @errors.length
+
+        # (a) One parameter feeding several properties: only one of them could
+        # own the argument, so the rest keep a default or deploy undefined.
+        ctor.params.each do |param|
+          props = (param_to_props[param.name] || []).uniq
+          next unless props.length > 1
+
+          add_error(
+            "constructor parameter '#{param.name}' initialises more than one property " \
+            "(#{props.sort.join(', ')}). Each constructor parameter is spliced into " \
+            "exactly one property's deploy-time slot, so only the first would receive " \
+            "the argument. Declare one parameter per property.",
+            loc: ctor.source_location
+          )
+        end
+
+        # (b) One property fed by several parameters -- no single argument owns it.
+        @contract.properties.each do |prop|
+          params = (prop_to_params[prop.name] || []).uniq
+          next unless params.length > 1
+
+          add_error(
+            "property '#{prop.name}' is assigned more than one constructor parameter " \
+            "(#{params.sort.join(', ')}). Each property that needs a deploy-time value " \
+            "corresponds to exactly one constructor parameter.",
+            loc: ctor.source_location
+          )
+        end
+
+        # (c) A property that needs a deploy-time value but whose constructor
+        # assignment is not a parameter. A property assigned NOTHING is already
+        # reported above, so it is skipped here rather than double-reported.
+        @contract.properties.each do |prop|
+          next unless prop.initializer.nil?
+
+          params = prop_to_params[prop.name]
+          next if params.nil? || !params.uniq.empty?
+
+          add_error(
+            "property '#{prop.name}' has no initializer and is not assigned a constructor " \
+            "parameter, so it has no deploy-time value. The constructor body is not " \
+            "compiled into the locking script — give the property a literal initializer " \
+            "or assign it a constructor parameter (this.#{prop.name} = #{prop.name}).",
+            loc: ctor.source_location
+          )
+        end
+
+        # (d) A parameter that initialises nothing: its argument is dropped and,
+        # because slots are positional, every later argument lands in the wrong slot.
+        ctor.params.each do |param|
+          next if param_to_props.key?(param.name)
+
+          add_error(
+            "constructor parameter '#{param.name}' does not initialise any property. " \
+            "Constructor arguments are spliced into property slots positionally, so an " \
+            "unused parameter drops its own argument and shifts every later one into the " \
+            "wrong property's slot. Assign it (this.#{param.name} = #{param.name}) or " \
+            "remove the parameter.",
+            loc: ctor.source_location
+          )
+        end
+
+        # (e) Order. Only meaningful once (a)-(d) hold, otherwise the positions
+        # being compared are themselves the thing that is broken.
+        return unless @errors.length == before
+
+        slot = 0
+        @contract.properties.each do |prop|
+          params = (prop_to_params[prop.name] || []).uniq
+          single = params.length == 1 ? params.first : nil
+          next if !prop.initializer.nil? && single.nil?
+
+          unless single.nil?
+            declared = param_index[single]
+            if declared != slot
+              abi_name = slot < ctor.params.length ? ctor.params[slot].name : "?"
+              add_error(
+                "property '#{prop.name}' occupies deploy-time slot #{slot}, but the " \
+                "constructor parameter that initialises it ('#{single}') is declared at " \
+                "position #{declared}. Constructor arguments are spliced positionally, so " \
+                "the deployed script would carry argument #{slot} — advertised by the ABI " \
+                "as parameter '#{abi_name}' — in this property's slot. Declare the " \
+                "parameters in the same order as the properties they initialise.",
+                loc: ctor.source_location
+              )
+            end
+          end
+          slot += 1
+        end
       end
 
       # -------------------------------------------------------------------
@@ -228,6 +384,35 @@ module RunarCompiler
         @errors << Diagnostic.new(message: msg, severity: Severity::ERROR, loc: loc)
       end
 
+      # Resolve the contract property an assignment target writes to, if any.
+      # Unwraps IndexAccessExpr chains so `this.grid[i][j] = v` resolves to
+      # `grid`.
+      def written_property(target)
+        node = target
+        node = node.object while node.is_a?(IndexAccessExpr)
+        node.is_a?(PropertyAccessExpr) ? node.property : nil
+      end
+
+      # Whether the expression is a literal allowed as a property initializer
+      # (bigint, bool, bytestring, or a negated bigint literal). Mirrors the
+      # TS/Go validator helpers.
+      def literal_expression?(expr)
+        return true if expr.is_a?(BigIntLiteral) || expr.is_a?(BoolLiteral) || expr.is_a?(ByteStringLiteral)
+        return expr.operand.is_a?(BigIntLiteral) if expr.is_a?(UnaryExpr) && expr.op == "-"
+
+        false
+      end
+
+      # Whether the expression is an array literal whose elements are all
+      # literal values (recursively, for nested FixedArray initializers).
+      def array_literal_of_literals?(expr)
+        return false unless expr.is_a?(ArrayLiteralExpr)
+
+        expr.elements.all? do |el|
+          el.is_a?(ArrayLiteralExpr) ? array_literal_of_literals?(el) : literal_expression?(el)
+        end
+      end
+
       # -------------------------------------------------------------------
       # Property type validation (private)
       # -------------------------------------------------------------------
@@ -271,6 +456,9 @@ module RunarCompiler
       # -------------------------------------------------------------------
 
       def validate_method(method)
+        # `return` is a PRIVATE-helper construct only (NEW-012).
+        reject_return_in_public_method(method) if method.visibility == "public"
+
         # Public methods must end with an assert() call (unless
         # StatefulSmartContract, where the compiler auto-injects the final
         # assert; or UnsafeSmartContract, where a terminal asm({..., out_arity:
@@ -324,8 +512,81 @@ module RunarCompiler
           end
         end
 
+        # readonly properties may only be assigned in the constructor.
+        check_readonly_writes(method)
+
         # Validate statements
         method.body.each { |stmt| validate_statement(stmt) }
+      end
+
+      # -------------------------------------------------------------------
+      # Readonly property writes (private)
+      # -------------------------------------------------------------------
+
+      # Report every write to a readonly contract property in a method body.
+      #
+      #   spec/semantics.md:
+      #     <this.p = e, env, sigma> ==> ERROR: cannot assign to readonly property
+      #
+      # The constructor is exempt -- that is where every contract initialises
+      # its readonly properties -- so this runs per METHOD only
+      # (validate_constructor never calls in here).
+      #
+      # Three AST shapes reach update_prop in ANF lowering and are all
+      # covered: `this.p = e`, `this.p++` / `this.p--`, and `this.arr[i] = e`.
+      def check_readonly_writes(method)
+        readonly = @contract.properties.select(&:readonly).map(&:name).to_set
+        return if readonly.empty?
+
+        report = lambda do |name, loc|
+          add_error(
+            "cannot assign to readonly property '#{name}' in method " \
+            "'#{method.name}'. readonly properties may only be assigned " \
+            "in the constructor.",
+            loc: loc
+          )
+        end
+
+        visit_expr = lambda do |expr, loc|
+          next if expr.nil?
+
+          visitor = proc do |e|
+            next unless e.is_a?(IncrementExpr) || e.is_a?(DecrementExpr)
+
+            name = written_property(e.operand)
+            report.call(name, loc) if !name.nil? && readonly.include?(name)
+          end
+          walk_expr(expr, visitor)
+        end
+
+        visit_statements = nil
+        visit_statements = lambda do |stmts|
+          stmts.each do |stmt|
+            case stmt
+            when AssignmentStmt
+              name = written_property(stmt.target)
+              report.call(name, stmt.source_location) if !name.nil? && readonly.include?(name)
+              visit_expr.call(stmt.target, stmt.source_location)
+              visit_expr.call(stmt.value, stmt.source_location)
+            when VariableDeclStmt
+              visit_expr.call(stmt.init, stmt.source_location)
+            when ExpressionStmt
+              visit_expr.call(stmt.expr, stmt.source_location)
+            when ReturnStmt
+              visit_expr.call(stmt.value, stmt.source_location)
+            when IfStmt
+              visit_expr.call(stmt.condition, stmt.source_location)
+              visit_statements.call(stmt.then)
+              visit_statements.call(stmt.else_ || [])
+            when ForStmt
+              visit_statements.call([stmt.init, stmt.update].compact)
+              visit_expr.call(stmt.condition, stmt.source_location)
+              visit_statements.call(stmt.body)
+            end
+          end
+        end
+
+        visit_statements.call(method.body)
       end
 
       # -------------------------------------------------------------------
@@ -445,6 +706,66 @@ module RunarCompiler
         end
 
         false
+      end
+
+      # -------------------------------------------------------------------
+      # Helper: reject_return_in_public_method
+      # -------------------------------------------------------------------
+
+      # Enforces spec/grammar.md:161 ("Public methods MUST return `void`") and
+      # :162 ("Public methods MUST end with an `assert(...)` call as their final
+      # statement").
+      #
+      # spec/semantics.md gives `return` no early-exit meaning at all: 4.6
+      # defines it ONLY as "the value of this method is v" (the private-helper
+      # inlining semantics), while 4.7 sequences statements UNCONDITIONALLY --
+      # there is no rule under which the statements after a `return` are
+      # skipped.
+      #
+      # Lowering it as if it were the tail of an inlined helper produced two
+      # different broken scripts (NEW-012):
+      #
+      #   - `return;`      the enclosing branch had no result to contribute, so
+      #                    its arm yielded OP_0 and the whole script evaluated
+      #                    FALSE -- an unspendable UTXO from source that
+      #                    compiled clean.
+      #   - `return expr;` the returned value became the branch result and hence
+      #                    the script's final truthiness, so any truthy expr
+      #                    spent the contract WITHOUT reaching the guarding
+      #                    assert. Fail-OPEN.
+      #
+      # The Java tier has always rejected the valued form; this brings the rule
+      # to every tier and covers the bare form too.
+      def reject_return_in_public_method(method)
+        find_return_statements(method.body).each do |ret|
+          add_error(
+            "public method '#{method.name}' must not use `return`: public methods " \
+            "are spending entry points, they return void (spec/grammar.md:161) " \
+            "and must end with an assert() that encodes the spending condition " \
+            "(spec/grammar.md:162). R\u00fanar has no early exit \u2014 restructure " \
+            "the guard as an if/else, or move the logic into a private helper, " \
+            "where `return` is allowed.",
+            loc: ret.source_location
+          )
+        end
+      end
+
+      # Every `return` in +body+, at any nesting depth (arms, loop bodies).
+      def find_return_statements(body)
+        found = []
+        walk = lambda do |stmts|
+          Array(stmts).each do |stmt|
+            case stmt
+            when ReturnStmt then found << stmt
+            when IfStmt
+              walk.call(stmt.then)
+              walk.call(stmt.else_)
+            when ForStmt then walk.call(stmt.body)
+            end
+          end
+        end
+        walk.call(body)
+        found
       end
 
       # -------------------------------------------------------------------

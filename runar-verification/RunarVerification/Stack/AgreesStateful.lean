@@ -158,7 +158,7 @@ theorem lowerValueP_checkPreimage_statefulPrologue
     (hne1 : pre ≠ "_cp0") :
     Lower.lowerValueP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre] "_cp0" (.checkPreimage pre)
-      = (statefulPrologueOps, ["_cp0"], localBindings) := by
+      = (statefulPrologueOps, (["_cp0"] : Stack.Lower.StackMap), localBindings) := by
   unfold Lower.lowerValueP
   simp [Lower.lowerCheckPreimageOpsLive, Lower.loadRefLive, Lower.bringToTop,
     Lower.StackMap.depth?, Lower.isLastUse,
@@ -191,7 +191,7 @@ theorem lowerBindingsP_statefulPrologue
     (Lower.lowerBindingsP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre]
         (StatefulBridge.gatedStatefulPrologueBody pre))
-      = (statefulPrologueOps ++ [.opcode "OP_VERIFY"], []) := by
+      = (statefulPrologueOps ++ [.opcode "OP_VERIFY"], ([] : Stack.Lower.StackMap)) := by
   show (Lower.lowerBindingsP progMethods props budget 0 [("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre]
         [⟨"_cp0", .checkPreimage pre, none⟩, ⟨"_v", .assert "_cp0", none⟩])
@@ -231,6 +231,15 @@ theorem lowerMethod_ops_statefulPrologue
       (StatefulBridge.gatedStatefulPrologueBody pre) = false := by
     simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
       Lower.bindingsUseCodePart]
+  -- Issue #100: the `_codePart` gate is now `bindingsUseCodePart ||
+  -- bindingsReadVarLenState`. The prologue body is preimage/codesep
+  -- plumbing with no `load_prop` at all, so the new disjunct is `false`
+  -- for ANY property set and the initial stack map is unchanged.
+  have hReadsVarLen : Lower.bindingsReadVarLenState progMethods
+      (Lower.varLenPropNames props) progMethods.length
+      (StatefulBridge.gatedStatefulPrologueBody pre) = false := by
+    simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
+      Lower.bindingsReadVarLenState]
   have hConstInts : Lower.collectConstInts
       (StatefulBridge.gatedStatefulPrologueBody pre) = [] := by
     simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
@@ -245,13 +254,23 @@ theorem lowerMethod_ops_statefulPrologue
       Lower.bindingsUseDeserializeState]
   -- BUG-100: initial stack map is just `[pre]` (`usesPreimage=true` but
   -- `usesCode=false`, so the inner `if` gives `userMap`; no `_opPushTxSig`).
-  rw [hUsesPre, hUsesCode, computeLastUses_statefulPrologue pre hne1, hConstInts]
-  simp only [if_true, if_false, List.cons_append, List.nil_append]
+  rw [hUsesPre, hUsesCode, hReadsVarLen,
+    computeLastUses_statefulPrologue pre hne1, hConstInts]
+  simp only [Bool.or_self, if_true, if_false, List.cons_append, List.nil_append]
   rw [show ((StatefulBridge.gatedStatefulPrologueBody pre).map (·.name))
         = ["_cp0", "_v"] by
       simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
         ANFBinding.name]]
   simp only [Bool.false_eq_true, if_false, if_true]
+  -- NEW-004: the stateful prologue is preimage/codesep plumbing with no
+  -- byte-array producer, so the method-wide raw-slot set is empty.
+  rw [show Lower.collectRawSlots (StatefulBridge.gatedStatefulPrologueBody pre) = [] from by
+        simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
+          Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]]
+  -- …and no `array_literal` binding either.
+  rw [show Lower.arrayElemsOf (StatefulBridge.gatedStatefulPrologueBody pre) = [] from by
+        simp [StatefulBridge.gatedStatefulPrologueBody, AgreesD2.statefulPrologueBody,
+          Lower.arrayElemsOf]]
   simp only [lowerBindingsP_statefulPrologue progMethods props
     Lower.defaultInlineBudget ["_cp0", "_v"] pre hne1]
   simp [hEndsAssert, hNoDeser, statefulPrologueOps]
@@ -421,7 +440,8 @@ theorem lowerValueP_checkPreimage_statefulFull
         [] localBindings [] [pre, stateVal, sats, "_codePart"]
         "_cp0" (.checkPreimage pre)
       = ([.opcode "OP_CODESEPARATOR", .rawBytes Lower.checkPreimageBindingBytes],
-         ["_cp0", stateVal, sats, "_codePart"], localBindings) := by
+         (["_cp0", stateVal, sats, "_codePart"] : Stack.Lower.StackMap),
+         localBindings) := by
   have e1 : ("" == pre) = false := beq_eq_false_iff_ne.mpr (Ne.symm hPE)
   have e2 : (stateVal == pre) = false := beq_eq_false_iff_ne.mpr (Ne.symm hPV)
   have e3 : (sats == pre) = false := beq_eq_false_iff_ne.mpr (Ne.symm hPS)
@@ -442,7 +462,7 @@ theorem lowerValueP_assert_statefulFull
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] ["_cp0", stateVal, sats, "_codePart"]
         "_v" (.assert "_cp0")
-      = ([.opcode "OP_VERIFY"], [stateVal, sats, "_codePart"], localBindings) := by
+      = ([.opcode "OP_VERIFY"], ([stateVal, sats, "_codePart"] : Stack.Lower.StackMap), localBindings) := by
   unfold Lower.lowerValueP
   simp [Lower.loadRefLive, Lower.bringToTop, Lower.StackMap.depth?,
     Lower.StackMap.popN, Lower.isLastUse, Lower.lastUsesLookup,
@@ -464,7 +484,7 @@ theorem lowerValueP_addOutput_statefulFull
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] [stateVal, sats, "_codePart"]
         "_so0" (.addOutput sats [stateVal] "")
-      = (statefulFullEpilogueOps, ["_so0", "_codePart"], localBindings) := by
+      = (statefulFullEpilogueOps, (["_so0", "_codePart"] : Stack.Lower.StackMap), localBindings) := by
   unfold Lower.lowerValueP
   simp [Lower.lowerAddOutputOpsLive, Lower.addOutputStateValuesLive,
     Lower.loadRefOperand, Lower.operandConsume, Lower.bringToTop,
@@ -491,13 +511,13 @@ theorem lowerBindingsP_statefulFull
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre, stateVal, sats, "_codePart"]
         (statefulFullBody pre sats stateVal)
-      = (statefulFullOps, ["_so0", "_codePart"]) := by
+      = (statefulFullOps, (["_so0", "_codePart"] : Stack.Lower.StackMap)) := by
   show Lower.lowerBindingsP progMethods props budget 0
         [("", 2), (stateVal, 2), (sats, 2), ("_cp0", 1), (pre, 0)]
         [] localBindings [] [pre, stateVal, sats, "_codePart"]
         [⟨"_cp0", .checkPreimage pre, none⟩, ⟨"_v", .assert "_cp0", none⟩,
          ⟨"_so0", .addOutput sats [stateVal] "", none⟩]
-      = (statefulFullOps, ["_so0", "_codePart"])
+      = (statefulFullOps, (["_so0", "_codePart"] : Stack.Lower.StackMap))
   rw [Lower.lowerBindingsP.eq_def]
   simp only [lowerValueP_checkPreimage_statefulFull progMethods props budget
     localBindings pre sats stateVal hPE hPS hPV hPC]
@@ -562,12 +582,25 @@ theorem lowerMethod_ops_statefulFull
   rw [hUsesPre, hUsesCode,
     computeLastUses_statefulFull pre sats stateVal hPC hPE hSE hVE hSC hVC
       (Ne.symm hPS) (Ne.symm hPV) hSV, hConstInts]
-  simp only [if_true, List.cons_append, List.nil_append]
+  -- Issue #100: `usesCode` is now `bindingsUseCodePart || bindingsReadVarLenState`
+  -- and this body's `add_output` already makes the first disjunct `true`.
+  simp only [Bool.true_or, if_true, List.cons_append, List.nil_append]
   rw [show ((statefulFullBody pre sats stateVal).map (·.name))
         = ["_cp0", "_v", "_so0"] by
       simp [statefulFullBody, StatefulBridge.gatedStatefulPrologueBody,
         AgreesD2.statefulPrologueBody, AgreesD2.statefulEpilogueBody,
         ANFBinding.name]]
+  -- NEW-004: see the prologue peer — no byte-array producer in the
+  -- stateful full body either.
+  rw [show Lower.collectRawSlots (statefulFullBody pre sats stateVal) = [] from by
+        simp [statefulFullBody, StatefulBridge.gatedStatefulPrologueBody,
+          AgreesD2.statefulPrologueBody, AgreesD2.statefulEpilogueBody,
+          Lower.collectRawSlots, Lower.collectRawSlotsGo, Lower.rawResultValue]]
+  -- …and no `array_literal` binding either.
+  rw [show Lower.arrayElemsOf (statefulFullBody pre sats stateVal) = [] from by
+        simp [statefulFullBody, StatefulBridge.gatedStatefulPrologueBody,
+          AgreesD2.statefulPrologueBody, AgreesD2.statefulEpilogueBody,
+          Lower.arrayElemsOf]]
   simp only [lowerBindingsP_statefulFull progMethods props
     Lower.defaultInlineBudget ["_cp0", "_v", "_so0"] pre sats stateVal pn hProps
     hPE hPS hPV hPC hSE hVE hSV hSC hVC hVCp hSCp hVA hSA]
