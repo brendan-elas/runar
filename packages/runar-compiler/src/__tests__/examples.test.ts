@@ -50,6 +50,22 @@ function findExampleContracts(): ExampleContract[] {
 }
 
 const examples = findExampleContracts();
+const compiledExamples = new Map<ExampleContract, ReturnType<typeof compile>>();
+
+/**
+ * Compile each source once for the structural assertions below. Large
+ * cryptographic examples can synthesize close to a megabyte of script, so
+ * repeating the full frontend and backend pipeline in every assertion makes
+ * this discovery suite needlessly expensive without adding coverage.
+ */
+function compileExample(example: ExampleContract): ReturnType<typeof compile> {
+  let result = compiledExamples.get(example);
+  if (result === undefined) {
+    result = compile(example.source, { fileName: example.fileName });
+    compiledExamples.set(example, result);
+  }
+  return result;
+}
 
 /**
  * Assert a full frontend compile and hand back the narrowed pieces.
@@ -85,7 +101,7 @@ describe('Example contracts: end-to-end compilation', () => {
   for (const example of examples) {
     describe(`${example.name} (${example.fileName})`, () => {
       it('compiles through the TS compiler (parse + validate + typecheck + ANF)', () => {
-        const result = compile(example.source, { fileName: example.fileName });
+        const result = compileExample(example);
 
         // The compile function should always return a result (not throw)
         expect(result).toBeDefined();
@@ -109,7 +125,7 @@ describe('Example contracts: end-to-end compilation', () => {
       });
 
       it('produces a valid artifact structure', () => {
-        const compileResult = compile(example.source, { fileName: example.fileName });
+        const compileResult = compileExample(example);
         const { anf, contract } = requireCompiled(compileResult, example.fileName);
 
         const stackProgram = lowerToStack(anf);
@@ -169,7 +185,7 @@ describe('Example contracts: end-to-end compilation', () => {
       });
 
       it('produces a non-empty locking script', () => {
-        const compileResult = compile(example.source, { fileName: example.fileName });
+        const compileResult = compileExample(example);
         const { anf } = requireCompiled(compileResult, example.fileName);
 
         const stackProgram = lowerToStack(anf);
@@ -181,7 +197,7 @@ describe('Example contracts: end-to-end compilation', () => {
       });
 
       it('has at least one public method in the ABI', () => {
-        const compileResult = compile(example.source, { fileName: example.fileName });
+        const compileResult = compileExample(example);
         const { contract } = requireCompiled(compileResult, example.fileName);
 
         const publicMethods = contract.methods.filter(
@@ -200,7 +216,7 @@ describe('Example contracts: end-to-end compilation', () => {
 describe('Example contracts: ANF IR structure', () => {
   for (const example of examples) {
     it(`${example.name} ANF IR has expected shape`, () => {
-      const result = compile(example.source, { fileName: example.fileName });
+      const result = compileExample(example);
       const { anf } = requireCompiled(result, example.fileName);
 
       // Must have a contract name (may differ from file name)
