@@ -11,9 +11,18 @@ import (
 // The insecure legacy checkPreimage accepted a witness signature over the real
 // spending transaction and checked it against pubkey G, never reading the pushed
 // preimage — so the preimage was decoupled from the tx. This derives the ECDSA
-// signature FROM the preimage on-chain (s = (hash256(preimage) + r)*kinv mod n,
-// fixed nonce k=2, privkey d=1, low-S, minimal DER), so OP_CHECKSIG passes only
-// when hash256(preimage) equals the real tx sighash.
+// signature FROM the preimage on-chain, so OP_CHECKSIG passes only when
+// hash256(preimage) equals the real tx sighash.
+//
+// Any-S construction: nonce k=1, so R = G and r = Gx needs no k-inverse
+// multiply and no sign pad; signing key d = 2^248 * Gx^-1 mod n, chosen so
+// r*d == 2^248 and the addend is built on-stack in six script bytes. The
+// derivation collapses to s = z + 2^248 mod n (z = hash256(preimage)),
+// normalised branchlessly to low-S, then DER-encoded from the minimal
+// script-number form. Public key 02b405d7...83b0 = d*G.
+//
+// d being public is not a weakness: the binding never depended on key secrecy,
+// only on the signature being derived from the PUSHED preimage on-chain.
 //
 // The construction compiles to a FIXED byte sequence identical across all seven
 // tiers; it is the canonical output of the TypeScript reference

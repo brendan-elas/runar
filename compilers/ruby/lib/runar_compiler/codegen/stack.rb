@@ -705,7 +705,8 @@ module RunarCompiler::Codegen
     # real spending transaction and checked it against pubkey G, never reading
     # the pushed preimage -- so the preimage was decoupled from the tx. This
     # derives the ECDSA signature FROM the preimage on-chain (s =
-    # (hash256(preimage) + r)*kinv mod n, fixed nonce k=2, privkey d=1, low-S,
+    # Any-S: nonce k=1 so r = Gx, signing key d = 2^248 * Gx^-1 mod n so
+    # r*d == 2^248, giving s = z + 2^248 mod n for z = hash256(preimage); low-S,
     # minimal DER), so OP_CHECKSIG passes only when hash256(preimage) equals the
     # real tx sighash.
     #
