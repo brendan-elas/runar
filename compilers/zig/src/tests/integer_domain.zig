@@ -34,6 +34,9 @@
 const std = @import("std");
 const compiler_api = @import("../compiler_api.zig");
 const ir_json = @import("../ir/json.zig");
+const stack_lower = @import("../passes/stack_lower.zig");
+const peephole = @import("../passes/peephole.zig");
+const emit = @import("../codegen/emit.zig");
 
 /// Compile a `.runar.ts` source to locking-script hex. `.runar.ts` rather
 /// than the Zig surface syntax so these sources are byte-for-byte the ones
@@ -222,6 +225,48 @@ test "D2: load_const with a bare JSON number beyond i128 loads as .big_integer" 
     try std.testing.expectEqualStrings(
         "1606938044258990275541962092341162602522202993782792835301376",
         program.methods[0].body[0].value.load_const.value.big_integer,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D6 — the peephole could only read one of the two push representations
+// ---------------------------------------------------------------------------
+
+test "D6: peephole folds big-representation operands, not just push_int" {
+    // The same arithmetic, but reaching the peephole as `push_big_int_decimal`
+    // rather than `push_int` — which is what happens on the `--ir` path, where
+    // the ANF names an oversize constant as decimal text.
+    //
+    // `getPushIntValue` could only see `push_int`, so the fold was skipped and
+    // a SMALLER window rule fired instead: `PUSH(2^63-1), PUSH(1), OP_ADD`
+    // collapsed to `PUSH(2^63-1), OP_1ADD`, and `PUSH(a), PUSH(a), OP_MUL`
+    // kept a runtime OP_MUL, where the other six tiers emit one folded push.
+    // The source path hides this completely, because the Zig parser routes an
+    // i64-sized literal to `push_int` — it is reachable only through `--ir`.
+    const ir =
+        \\{"contractName":"Probe","properties":[{"name":"target","type":"bigint","readonly":true}],
+        \\ "methods":[{"name":"check","params":[],"isPublic":true,"body":[
+        \\   {"name":"t0","value":{"kind":"load_const","value":"9223372036854775807n"}},
+        \\   {"name":"t1","value":{"kind":"load_const","value":"9223372036854775807n"}},
+        \\   {"name":"t2","value":{"kind":"bin_op","op":"*","left":"t0","right":"t1"}},
+        \\   {"name":"t3","value":{"kind":"load_prop","name":"target"}},
+        \\   {"name":"t4","value":{"kind":"bin_op","op":"===","left":"t2","right":"t3"}},
+        \\   {"name":"t5","value":{"kind":"assert","value":"t4"}}]}]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const program = try ir_json.parseANFProgram(alloc, ir);
+    const stack = try stack_lower.lower(alloc, program);
+    const optimized = try peephole.optimize(alloc, stack.methods);
+    const hex = try emit.emitMethodScript(alloc, optimized[0].instructions);
+
+    // (2^63-1)^2 as one 16-byte push, then the constructor slot and the
+    // comparison. No OP_MUL (0x95) survives.
+    try std.testing.expectEqualStrings(
+        "100100000000000000ffffffffffffff3f009c",
+        hex,
     );
 }
 
