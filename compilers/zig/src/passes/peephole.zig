@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const const_arith = @import("const_arith.zig");
 const Opcode = types.Opcode;
 const Inst = types.StackInstruction;
 const Allocator = std.mem.Allocator;
@@ -58,6 +59,60 @@ fn getPushIntValue(inst: Inst) ?i64 {
     return switch (inst) {
         .push_int => |v| v,
         else => null,
+    };
+}
+
+/// Read a constant push operand at full precision, in EITHER representation
+/// (issue #162). Caller owns the result and must `deinit` it.
+///
+/// `getPushIntValue` only sees `push_int`. That was enough while every
+/// constant the lowerer emitted fit `i64`, but an ANF `load_const` carrying
+/// an oversize value lowers to `push_big_int_decimal`, and the arithmetic
+/// rules below then could not read it. The fold was skipped and a smaller
+/// window rule fired instead: `PUSH(2^63-1), PUSH(1), OP_ADD` became
+/// `PUSH(2^63-1), OP_1ADD` rather than folding to `PUSH(2^63)`, and
+/// `PUSH(a), PUSH(a), OP_MUL` kept a runtime `OP_MUL`, where the other six
+/// tiers emit a single folded push. That divergence is invisible from the
+/// source path (the Zig parser hands i64-sized literals to `push_int`) and
+/// shows up only through `--ir`, on ANF that names the constants as decimal
+/// text.
+fn pushOperand(allocator: Allocator, inst: Inst) !?const_arith.Big {
+    return switch (inst) {
+        .push_int => |v| try const_arith.fromI128(allocator, v),
+        .push_big_int_decimal => |s| blk: {
+            var m = try const_arith.Big.init(allocator);
+            errdefer m.deinit();
+            m.setString(10, s) catch {
+                m.deinit();
+                break :blk null;
+            };
+            break :blk m;
+        },
+        else => null,
+    };
+}
+
+/// Build the push instruction for a folded constant.
+///
+/// A result that still fits `i64` stays a `push_int` so nothing about the
+/// ordinary output moves; anything wider goes through the arbitrary-precision
+/// decimal push, exactly as the load-const path does.
+///
+/// These rules previously closed with `@as(i64, @truncate(...))`, which
+/// silently discarded the high bits: `4294967295 * 4294967295` came out as
+/// -8589934591 and the tier emitted a 5-byte push where the other six emit
+/// nine. The peephole always runs -- including with the ANF constant folder
+/// disabled -- and fold-OFF is the mode the checked-in conformance goldens
+/// are stamped in, so this was on the path every golden is replayed against.
+fn foldedPushBig(allocator: Allocator, m: const_arith.Big) !Inst {
+    const cv = try const_arith.store(allocator, m);
+    return switch (cv) {
+        .integer => |v| if (v >= std.math.minInt(i64) and v <= std.math.maxInt(i64))
+            Inst{ .push_int = @intCast(v) }
+        else
+            Inst{ .push_big_int_decimal = try std.fmt.allocPrint(allocator, "{d}", .{v}) },
+        .big_integer => |s| Inst{ .push_big_int_decimal = s },
+        else => unreachable,
     };
 }
 
@@ -183,7 +238,7 @@ fn runOnePassWithLocs(
         const head_loc = if (i < src_locs.len) src_locs[i] else null;
         // Window 4
         if (i + 4 <= ops.len) {
-            if (tryWindow4(ops[i..][0..4])) |replacement| {
+            if (try tryWindow4(allocator, ops[i..][0..4])) |replacement| {
                 for (replacement) |inst| {
                     if (inst) |r| {
                         try out_insts.append(allocator, r);
@@ -197,7 +252,7 @@ fn runOnePassWithLocs(
         }
         // Window 3
         if (i + 3 <= ops.len) {
-            if (tryWindow3(ops[i..][0..3])) |replacement| {
+            if (try tryWindow3(allocator, ops[i..][0..3])) |replacement| {
                 for (replacement) |inst| {
                     if (inst) |r| {
                         try out_insts.append(allocator, r);
@@ -273,7 +328,7 @@ fn runOnePass(allocator: Allocator, ops: []const Inst, out: *std.ArrayListUnmana
     while (i < ops.len) {
         // Try window size 4
         if (i + 4 <= ops.len) {
-            if (tryWindow4(ops[i..][0..4])) |replacement| {
+            if (try tryWindow4(allocator, ops[i..][0..4])) |replacement| {
                 for (replacement) |inst| {
                     if (inst) |r| try out.append(allocator, r);
                 }
@@ -284,7 +339,7 @@ fn runOnePass(allocator: Allocator, ops: []const Inst, out: *std.ArrayListUnmana
         }
         // Try window size 3
         if (i + 3 <= ops.len) {
-            if (tryWindow3(ops[i..][0..3])) |replacement| {
+            if (try tryWindow3(allocator, ops[i..][0..3])) |replacement| {
                 for (replacement) |inst| {
                     if (inst) |r| try out.append(allocator, r);
                 }
@@ -447,7 +502,7 @@ fn producesCanonicalBool(inst: Inst) bool {
     };
 }
 
-fn tryWindow3(w: *const [3]Inst) ?Replacement3 {
+fn tryWindow3(allocator: Allocator, w: *const [3]Inst) !?Replacement3 {
     // raw_bytes is a hard peephole barrier — never rewrite across it.
     if (isRawBytes(w[0]) or isRawBytes(w[1]) or isRawBytes(w[2])) return null;
 
@@ -471,28 +526,31 @@ fn tryWindow3(w: *const [3]Inst) ?Replacement3 {
         return .{ w[0], null, null };
     }
 
-    const va = getPushIntValue(w[0]) orelse return null;
-    const vb = getPushIntValue(w[1]) orelse return null;
+    // Rules 24-26 fold a constant pair. Read the operands at full precision
+    // and in either representation so an oversize `push_big_int_decimal` is
+    // folded the same as a `push_int` (issue #162).
+    if (!isOp(w[2], .op_add) and !isOp(w[2], .op_sub) and !isOp(w[2], .op_mul)) {
+        return null;
+    }
+    var a = (try pushOperand(allocator, w[0])) orelse return null;
+    defer a.deinit();
+    var b = (try pushOperand(allocator, w[1])) orelse return null;
+    defer b.deinit();
+
+    var r = try const_arith.Big.init(allocator);
+    defer r.deinit();
 
     // Rule 24: PUSH(a) + PUSH(b) + OP_ADD -> PUSH(a+b)
-    if (isOp(w[2], .op_add)) {
-        const result = @as(i64, @truncate(@as(i128, va) + @as(i128, vb)));
-        return .{ Inst{ .push_int = result }, null, null };
-    }
-
     // Rule 25: PUSH(a) + PUSH(b) + OP_SUB -> PUSH(a-b)
-    if (isOp(w[2], .op_sub)) {
-        const result = @as(i64, @truncate(@as(i128, va) - @as(i128, vb)));
-        return .{ Inst{ .push_int = result }, null, null };
-    }
-
     // Rule 26: PUSH(a) + PUSH(b) + OP_MUL -> PUSH(a*b)
-    if (isOp(w[2], .op_mul)) {
-        const result = @as(i64, @truncate(@as(i128, va) * @as(i128, vb)));
-        return .{ Inst{ .push_int = result }, null, null };
+    if (isOp(w[2], .op_add)) {
+        try r.add(&a, &b);
+    } else if (isOp(w[2], .op_sub)) {
+        try r.sub(&a, &b);
+    } else {
+        try r.mul(&a, &b);
     }
-
-    return null;
+    return .{ try foldedPushBig(allocator, r), null, null };
 }
 
 // ============================================================================
@@ -501,52 +559,49 @@ fn tryWindow3(w: *const [3]Inst) ?Replacement3 {
 
 const Replacement4 = [4]?Inst;
 
-fn tryWindow4(w: *const [4]Inst) ?Replacement4 {
+fn tryWindow4(allocator: Allocator, w: *const [4]Inst) !?Replacement4 {
     // raw_bytes is a hard peephole barrier — never rewrite across it.
     if (isRawBytes(w[0]) or isRawBytes(w[1]) or isRawBytes(w[2]) or isRawBytes(w[3])) return null;
+
+    // Rules 27-30 reassociate two constant operands across a pair of
+    // OP_ADD / OP_SUB. Like rules 24-26 they read at full precision and in
+    // either push representation (issue #162).
+    const add_add = isOp(w[1], .op_add) and isOp(w[3], .op_add);
+    const sub_sub = isOp(w[1], .op_sub) and isOp(w[3], .op_sub);
+    const add_sub = isOp(w[1], .op_add) and isOp(w[3], .op_sub);
+    const sub_add = isOp(w[1], .op_sub) and isOp(w[3], .op_add);
+    if (!add_add and !sub_sub and !add_sub and !sub_add) return null;
+
+    var a = (try pushOperand(allocator, w[0])) orelse return null;
+    defer a.deinit();
+    var b = (try pushOperand(allocator, w[2])) orelse return null;
+    defer b.deinit();
+
+    var r = try const_arith.Big.init(allocator);
+    defer r.deinit();
+
     // Rule 27: PUSH(a) + OP_ADD + PUSH(b) + OP_ADD -> PUSH(a+b) + OP_ADD
-    if (isOp(w[1], .op_add) and isOp(w[3], .op_add)) {
-        const va = getPushIntValue(w[0]) orelse return null;
-        const vb = getPushIntValue(w[2]) orelse return null;
-        const sum = @as(i64, @truncate(@as(i128, va) + @as(i128, vb)));
-        return .{ Inst{ .push_int = sum }, Inst{ .op = .op_add }, null, null };
+    if (add_add) {
+        try r.add(&a, &b);
+        return .{ try foldedPushBig(allocator, r), Inst{ .op = .op_add }, null, null };
     }
 
     // Rule 28: PUSH(a) + OP_SUB + PUSH(b) + OP_SUB -> PUSH(a+b) + OP_SUB
-    if (isOp(w[1], .op_sub) and isOp(w[3], .op_sub)) {
-        const va = getPushIntValue(w[0]) orelse return null;
-        const vb = getPushIntValue(w[2]) orelse return null;
-        const sum = @as(i64, @truncate(@as(i128, va) + @as(i128, vb)));
-        return .{ Inst{ .push_int = sum }, Inst{ .op = .op_sub }, null, null };
+    if (sub_sub) {
+        try r.add(&a, &b);
+        return .{ try foldedPushBig(allocator, r), Inst{ .op = .op_sub }, null, null };
     }
 
     // Rule 29: PUSH(a) + OP_ADD + PUSH(b) + OP_SUB -> PUSH(a-b) + OP_ADD (if a >= b)
     //          or PUSH(b-a) + OP_SUB (if b > a)
-    if (isOp(w[1], .op_add) and isOp(w[3], .op_sub)) {
-        const va = getPushIntValue(w[0]) orelse return null;
-        const vb = getPushIntValue(w[2]) orelse return null;
-        const diff = @as(i64, @truncate(@as(i128, va) - @as(i128, vb)));
-        if (diff >= 0) {
-            return .{ Inst{ .push_int = diff }, Inst{ .op = .op_add }, null, null };
-        } else {
-            return .{ Inst{ .push_int = -diff }, Inst{ .op = .op_sub }, null, null };
-        }
-    }
-
     // Rule 30: PUSH(a) + OP_SUB + PUSH(b) + OP_ADD -> PUSH(b-a) + OP_ADD (if b >= a)
     //          or PUSH(a-b) + OP_SUB (if a > b)
-    if (isOp(w[1], .op_sub) and isOp(w[3], .op_add)) {
-        const va = getPushIntValue(w[0]) orelse return null;
-        const vb = getPushIntValue(w[2]) orelse return null;
-        const diff = @as(i64, @truncate(@as(i128, vb) - @as(i128, va)));
-        if (diff >= 0) {
-            return .{ Inst{ .push_int = diff }, Inst{ .op = .op_add }, null, null };
-        } else {
-            return .{ Inst{ .push_int = -diff }, Inst{ .op = .op_sub }, null, null };
-        }
+    if (add_sub) try r.sub(&a, &b) else try r.sub(&b, &a);
+    if (!const_arith.isNegative(r)) {
+        return .{ try foldedPushBig(allocator, r), Inst{ .op = .op_add }, null, null };
     }
-
-    return null;
+    r.abs();
+    return .{ try foldedPushBig(allocator, r), Inst{ .op = .op_sub }, null, null };
 }
 
 // ============================================================================

@@ -311,6 +311,23 @@ KNOWN_PYTHON_BITCOINLIB_MISMATCHES = {
     # python-bitcoinlib still enforces it and refuses to evaluate the script.
     "convergence-proof": "script too large",
     "ec-unit": "script too large",
+    # Arbitrary-precision script numbers. BSV removed the 4-byte CScriptNum
+    # limit post-Genesis; python-bitcoinlib still enforces it and aborts in
+    # CastToBigNum() the moment it meets one of this fixture's 9- and 16-byte
+    # pushes. Those pushes are the entire point of integer-boundary (#162) —
+    # the fixture exists to pin (2^32-1)^2, 2^63, 2^64 and (2^63-1)^2 across
+    # the seven tiers — so the reference cannot evaluate it by construction.
+    #
+    # Recorded rather than glossed: the LEAN side also fails here, with
+    # "typeError: binary numeric op expects two ints". The Lean Stack VM's
+    # numeric ops are bounded below the language's arbitrary-precision domain
+    # in the same way the Zig tier was, so the model cannot evaluate these
+    # constants either. That is a real gap in the model — a Lean-side analogue
+    # of the defects #162 fixed in Zig — and it is NOT what this entry papers
+    # over. What this entry records is only that python-bitcoinlib yields zero
+    # oracle signal for a script it refuses to cast, so there is no cross-check
+    # to lose, exactly as for shift-ops above.
+    "integer-boundary": "CastToBigNum() : overflow",
 }
 
 # Benign opcode-LABEL divergences surfaced by the finding-#25 opcode

@@ -361,6 +361,26 @@ const LowerCtx = struct {
         try self.emit(.{ .push_big_int_decimal = decimal });
     }
 
+    /// Emit a push for a `ConstValue.integer` (issue #162).
+    ///
+    /// `ConstValue.integer` is `i128` while `emitPushInt` takes `i64`, and the
+    /// constant folder legitimately produces values between the two — the
+    /// product of two `i64`-max literals needs 126 bits. This routes anything
+    /// outside `i64` to the arbitrary-precision decimal push the tier already
+    /// has, so the emitted bytes match the other six tiers.
+    ///
+    /// The call sites previously narrowed with an unchecked `@intCast`, which
+    /// aborted the whole process ("integer does not fit in destination type",
+    /// exit 134) with no diagnostic and no source location.
+    fn emitPushConstInteger(self: *LowerCtx, n: i128) !void {
+        if (n >= std.math.minInt(i64) and n <= std.math.maxInt(i64)) {
+            return self.emitPushInt(@intCast(n));
+        }
+        const decimal = try std.fmt.allocPrint(self.allocator, "{d}", .{n});
+        try self.owned_push_data.append(self.allocator, decimal);
+        try self.emitPushBigIntDecimal(decimal);
+    }
+
     fn emitPushBool(self: *LowerCtx, b: bool) !void {
         try self.emit(.{ .push_bool = b });
     }
@@ -1247,7 +1267,7 @@ const LowerCtx = struct {
     fn lowerLoadConst(self: *LowerCtx, bind_name: []const u8, value: types.ConstValue) !void {
         switch (value) {
             .boolean => |b| try self.emitPushBool(b),
-            .integer => |n| try self.emitPushInt(@intCast(n)),
+            .integer => |n| try self.emitPushConstInteger(n),
             .big_integer => |s| try self.emitPushBigIntDecimal(s),
             .string => |s| {
                 if (std.mem.startsWith(u8, s, "@ref:")) {
@@ -1338,7 +1358,7 @@ const LowerCtx = struct {
                 if (prop.initial_value) |iv| {
                     switch (iv) {
                         .boolean => |b| try self.emitPushBool(b),
-                        .integer => |n| try self.emitPushInt(@intCast(n)),
+                        .integer => |n| try self.emitPushConstInteger(n),
                         .big_integer => |s| try self.emitPushBigIntDecimal(s),
                         .string => |s| try self.emitPushHexString(s),
                     }
@@ -3118,7 +3138,7 @@ const LowerCtx = struct {
             } else if (prop.initial_value) |iv| {
                 switch (iv) {
                     .boolean => |b| try self.emitPushBool(b),
-                    .integer => |n| try self.emitPushInt(@intCast(n)),
+                    .integer => |n| try self.emitPushConstInteger(n),
                     .big_integer => |s| try self.emitPushBigIntDecimal(s),
                     .string => |s| try self.emitPushData(s),
                 }
