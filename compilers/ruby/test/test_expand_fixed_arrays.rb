@@ -340,8 +340,11 @@ class TestExpandFixedArrays < Minitest::Test
     # tiers: audits/v1-review/claude/repro/NEW-014-tictactoe-spends-at-9616.mts
     # plays a full game on the real @bsv/sdk Spend engine and proves moveAndWin
     # on a board with NO line is still REJECTED.
-    assert_equal 9616, v1.script.length / 2, "v1 script must be 9616 bytes"
-    assert_equal 9616, v2.script.length / 2, "v2 script must be 9616 bytes"
+    # Then the Any-S OP_PUSH_TX construction took it 9616 -> 7624: TicTacToe
+    # is stateful with six covenant methods, each carrying one
+    # preimage-binding blob, so 6 x (760 - 428) = 1992 bytes come off.
+    assert_equal 7624, v1.script.length / 2, "v1 script must be 7624 bytes"
+    assert_equal 7624, v2.script.length / 2, "v2 script must be 7624 bytes"
     assert_equal v1.script, v2.script, "TicTacToe v1 and v2 scripts must be byte-identical"
   end
 
