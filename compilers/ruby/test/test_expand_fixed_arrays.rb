@@ -329,10 +329,19 @@ class TestExpandFixedArrays < Minitest::Test
     # fix re-emits it as `assert(cond0 || ... || cond8)` (+27 bytes). Matches the
     # fixed TS reference fold-ON output. Re-updated for the C17 fix: `not-not-elim`
     # is now guarded on a canonical-bool producer, so the 9 `if (this.cN != 0n)`
-    # tests each keep their OP_NOT OP_NOT normalisation (+18 bytes); the Any-S
-    # preimage blob (428 bytes vs the legacy 760) puts the total at 7502.
-    assert_equal 7502, v1.script.length / 2, "v1 script must be 7502 bytes"
-    assert_equal 7502, v2.script.length / 2, "v2 script must be 7502 bytes"
+    # tests each keep their OP_NOT OP_NOT normalisation (+18 bytes, 9476 -> 9494).
+    # Re-updated for NEW-014 (`&&` / `||` now SHORT-CIRCUIT on-chain, 9494 ->
+    # 9616): checkWinAfterMove is eight `v_a == player && v_b == player &&
+    # v_c == player` chains and `&&` is left-associative, so each stops being a
+    # pair of OP_BOOLANDs and becomes nested OP_IF / OP_ELSE branching. The
+    # growth IS the fix — OP_BOOLAND is a binary stack op, so both operands had
+    # to be evaluated, and an operand the source meant to skip can abort the
+    # script. Executed before this number moved, not merely agreed on by seven
+    # tiers: audits/v1-review/claude/repro/NEW-014-tictactoe-spends-at-9616.mts
+    # plays a full game on the real @bsv/sdk Spend engine and proves moveAndWin
+    # on a board with NO line is still REJECTED.
+    assert_equal 9616, v1.script.length / 2, "v1 script must be 9616 bytes"
+    assert_equal 9616, v2.script.length / 2, "v2 script must be 9616 bytes"
     assert_equal v1.script, v2.script, "TicTacToe v1 and v2 scripts must be byte-identical"
   end
 
