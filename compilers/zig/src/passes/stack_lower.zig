@@ -5241,8 +5241,10 @@ const LowerCtx = struct {
 // The insecure legacy checkPreimage accepted a witness signature over the real
 // spending transaction and checked it against pubkey G, never reading the pushed
 // preimage — so the preimage was decoupled from the tx. This derives the ECDSA
-// signature FROM the preimage on-chain (s = (hash256(preimage) + r)*kinv mod n,
-// fixed nonce k=2, privkey d=1, low-S, minimal DER), so OP_CHECKSIG passes only
+// signature FROM the preimage on-chain (Any-S: nonce k=1 so r = Gx, signing key
+// d = 2^248 * Gx^-1 mod n so r*d == 2^248, giving s = z + 2^248 mod n for
+// z = hash256(preimage); branchless low-S; DER from the minimal script-number
+// form; pubkey 02b405d7...83b0 = d*G), so OP_CHECKSIG passes only
 // when hash256(preimage) equals the real tx sighash.
 //
 // The construction compiles to a FIXED byte sequence identical across all seven
@@ -5250,14 +5252,14 @@ const LowerCtx = struct {
 // (packages/runar-compiler/src/passes/oppushtx-codegen.ts). Emitted as a single
 // opaque raw_bytes op (peephole barrier). The cross-tier conformance suite
 // guards that this constant matches every other tier byte-for-byte.
-const check_preimage_binding_hex = "76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c7501007e8121e59e705cb909acaba73cef8c4b8e775cd87cc0956e4045306d7ded41947f04c6009320a1201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7f9521414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff006e977b7578937c977620a0201b68462fe9df1d50a457736e575dffffffffffffffffffffffffffffff7fa07821414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007c8d7c949594826b012080007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c756c01207c947f777682775180527c7e7c7e768277012393518023022100c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee50130527a7e7c7e7c7e01417e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
+const check_preimage_binding_hex = "76aa517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e01007e8100011f80517e9321414136d08c5ed2bf3ba048afe6dcaebafeffffffffffffffffffffffffffffff007d97785296789f527952798d9495937776927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f76927f7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e7c7e827c7e23022079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798027c7e827c7e01307c7e01417e2102b405d7f0322a89d0f9f3a98e6f938fdc1c969a8d1382a2bf66a71ae74a1e83b0ad";
 
 // The frozen binding hex above ends with `0141` (OP_DATA_1 SIGHASH_ALL|FORKID)
 // immediately before this fixed G-pubkey tail. Issue #123: a non-default
 // @sighash mode swaps only that single push (`0141` -> `01<flag>`), leaving the
 // tail intact — byte-for-byte matching the TS reference. Mirrors Go's
 // checkPreimageSighashTail (compilers/go/codegen/oppushtx.go).
-const check_preimage_sighash_tail = "7e210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad";
+const check_preimage_sighash_tail = "7e2102b405d7f0322a89d0f9f3a98e6f938fdc1c969a8d1382a2bf66a71ae74a1e83b0ad";
 
 // ============================================================================
 // Public API

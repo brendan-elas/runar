@@ -667,7 +667,7 @@ test "e2e FixedArray: TicTacToe v2 is byte-identical to v1" {
 
     try std.testing.expectEqualStrings(v1_hex, v2_hex);
 
-    // Byte-count lock-in: the canonical TS compiler produces 9616 bytes for
+    // Byte-count lock-in: the canonical TS compiler produces 7624 bytes for
     // both TicTacToe variants. Any divergence from this length indicates a
     // regression in Zig's stack lowering or branch-reconciliation logic.
     // (BUG-100 fix: checkPreimage now emits the 760-byte on-chain OP_PUSH_TX
@@ -692,7 +692,11 @@ test "e2e FixedArray: TicTacToe v2 is byte-identical to v1" {
     // audits/v1-review/claude/repro/NEW-014-tictactoe-spends-at-9616.mts, which
     // plays a full game on the real @bsv/sdk Spend engine and proves that
     // moveAndWin on a board with NO line is still REJECTED.)
-    const expected_bytes: usize = 9616;
+    // The Any-S OP_PUSH_TX construction took this 9616 -> 7624: TicTacToe is
+    // stateful with six covenant methods, each carrying one preimage-binding
+    // blob, so 6 x (760 - 428) = 1992 bytes come off. The NEW-014 note above
+    // still stands -- it is why the pre-Any-S number was 9616 and not 9494.
+    const expected_bytes: usize = 7624;
     const actual_bytes = v1_hex.len / 2;
     try std.testing.expectEqual(expected_bytes, actual_bytes);
 
@@ -701,8 +705,14 @@ test "e2e FixedArray: TicTacToe v2 is byte-identical to v1" {
     // immediately instead of requiring a full cross-compiler conformance run.
     // (BUG-100 fix: the checkPreimage binding blob now follows the dispatch
     // prologue, replacing the old push-G / OP_CHECKSIG tail.)
+    //
+    // Re-derived for the Any-S construction, not hand-edited: the blob's
+    // digest reversal changed from a 7-byte-per-element accumulator loop
+    // (`007c517f7b7b7c7e...`) to a 4-byte-per-element fan-out, so the prefix
+    // is now `OP_1 OP_SPLIT` repeated. Taken verbatim from the merged
+    // compiler's output for examples/ts/tic-tac-toe/TicTacToe.runar.ts.
     const expected_prefix =
-        "76009c637576ab76aa007c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b7c7e7c517f7b7b";
+        "76009c637576ab76aa517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f517f51";
     try std.testing.expectEqualStrings(expected_prefix, v1_hex[0..expected_prefix.len]);
 }
 
