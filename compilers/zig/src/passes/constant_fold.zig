@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const types = @import("../ir/types.zig");
+const const_arith = @import("const_arith.zig");
 
 const Allocator = std.mem.Allocator;
 const ConstValue = types.ConstValue;
@@ -72,35 +73,61 @@ const bin_op_map = std.StaticStringMap(BinOpTag).initComptime(.{
     .{ "||", .op_logical_or },
 });
 
-fn evalBinOp(op: []const u8, left: ConstValue, right: ConstValue) ?ConstValue {
+fn evalBinOp(allocator: Allocator, op: []const u8, left: ConstValue, right: ConstValue) !?ConstValue {
     const tag = bin_op_map.get(op) orelse return null;
 
-    // Integer arithmetic / bitwise / comparison
-    if (left == .integer and right == .integer) {
-        const a = left.integer;
-        const b = right.integer;
+    // Integer arithmetic / bitwise / comparison.
+    //
+    // Evaluated at ARBITRARY precision (issue #162). The operands may arrive
+    // in either `ConstValue` integer representation, and a result may need
+    // more room than either — `(2^63-1)^2` needs 126 bits, `pow(2n, 200n)`
+    // needs 201. Folding these in a fixed width either aborted the process on
+    // the way to the emitter or, for `pow`, wrapped silently and emitted a
+    // different locking script from the other six tiers.
+    if (const_arith.isInteger(left) and const_arith.isInteger(right)) {
+        var a = (try const_arith.load(allocator, left)) orelse return null;
+        defer a.deinit();
+        var b = (try const_arith.load(allocator, right)) orelse return null;
+        defer b.deinit();
 
-        return switch (tag) {
-            .op_add => .{ .integer = a +% b },
-            .op_sub => .{ .integer = a -% b },
-            .op_mul => .{ .integer = a *% b },
-            .op_div => if (b == 0) null else .{ .integer = @divTrunc(a, b) },
-            .op_mod => if (b == 0) null else .{ .integer = a - @divTrunc(a, b) * b },
-            .op_strict_eq => .{ .boolean = a == b },
-            .op_strict_neq => .{ .boolean = a != b },
-            .op_lt => .{ .boolean = a < b },
-            .op_gt => .{ .boolean = a > b },
-            .op_lte => .{ .boolean = a <= b },
-            .op_gte => .{ .boolean = a >= b },
+        switch (tag) {
+            .op_add, .op_sub, .op_mul => {
+                var r = try const_arith.Big.init(allocator);
+                defer r.deinit();
+                switch (tag) {
+                    .op_add => try r.add(&a, &b),
+                    .op_sub => try r.sub(&a, &b),
+                    else => try r.mul(&a, &b),
+                }
+                return try const_arith.store(allocator, r);
+            },
+            .op_div => {
+                if (const_arith.isZero(b)) return null;
+                var q = try const_arith.divTrunc(allocator, a, b);
+                defer q.deinit();
+                return try const_arith.store(allocator, q);
+            },
+            .op_mod => {
+                if (const_arith.isZero(b)) return null;
+                var r = try const_arith.remTrunc(allocator, a, b);
+                defer r.deinit();
+                return try const_arith.store(allocator, r);
+            },
+            .op_strict_eq => return .{ .boolean = const_arith.order(a, b) == .eq },
+            .op_strict_neq => return .{ .boolean = const_arith.order(a, b) != .eq },
+            .op_lt => return .{ .boolean = const_arith.order(a, b) == .lt },
+            .op_gt => return .{ .boolean = const_arith.order(a, b) == .gt },
+            .op_lte => return .{ .boolean = const_arith.order(a, b) != .gt },
+            .op_gte => return .{ .boolean = const_arith.order(a, b) != .lt },
             // OP_AND/OP_OR/OP_XOR/OP_LSHIFT/OP_RSHIFT operate on the operands'
             // raw script-number BYTES, not their numeric value — native
             // folding diverges from the deployed script (e.g. 255 << 1 is 254
             // on-chain, not 510; 255 & 1 aborts). Never fold; emit the opcode
             // so the interpreter's byte-array semantics govern. Matches TS
             // constant-fold + vm/utils scriptNumber*.
-            .op_bit_and, .op_bit_or, .op_bit_xor, .op_shl, .op_shr => null,
-            .op_logical_and, .op_logical_or => null,
-        };
+            .op_bit_and, .op_bit_or, .op_bit_xor, .op_shl, .op_shr => return null,
+            .op_logical_and, .op_logical_or => return null,
+        }
     }
 
     // Boolean operations
@@ -147,7 +174,7 @@ const unary_op_map = std.StaticStringMap(UnaryOpTag).initComptime(.{
     .{ "!", .op_logical_not },
 });
 
-fn evalUnaryOp(op: []const u8, operand: ConstValue) ?ConstValue {
+fn evalUnaryOp(allocator: Allocator, op: []const u8, operand: ConstValue) !?ConstValue {
     const tag = unary_op_map.get(op) orelse return null;
 
     if (operand == .boolean) {
@@ -156,16 +183,24 @@ fn evalUnaryOp(op: []const u8, operand: ConstValue) ?ConstValue {
             else => null,
         };
     }
-    if (operand == .integer) {
-        const n = operand.integer;
-        return switch (tag) {
-            .op_negate => .{ .integer = -%n },
+    if (const_arith.isInteger(operand)) {
+        var n = (try const_arith.load(allocator, operand)) orelse return null;
+        defer n.deinit();
+        switch (tag) {
+            .op_negate => {
+                var zero = try const_arith.fromI128(allocator, 0);
+                defer zero.deinit();
+                var r = try const_arith.Big.init(allocator);
+                defer r.deinit();
+                try r.sub(&zero, &n);
+                return try const_arith.store(allocator, r);
+            },
             // OP_INVERT flips the operand's script-number bytes, not native
             // ~n (~5 == -122, ~0 == 0). Never fold; emit the opcode so the
             // interpreter's byte-array semantics govern. Matches TS.
-            .op_bitwise_not => null,
-            .op_logical_not => .{ .boolean = n == 0 },
-        };
+            .op_bitwise_not => return null,
+            .op_logical_not => return .{ .boolean = const_arith.isZero(n) },
+        }
     }
     return null;
 }
@@ -210,126 +245,182 @@ const builtin_map = std.StaticStringMap(BuiltinTag).initComptime(.{
     .{ "bool", .builtin_bool },
 });
 
-fn evalBuiltinCall(func_name: []const u8, args: []const []const u8, env: *const ConstEnv) ?ConstValue {
+/// Evaluate a pure math builtin over constant arguments at ARBITRARY
+/// precision (issue #162).
+///
+/// Mirrors `foldBuiltin` in packages/runar-compiler/src/optimizer/
+/// constant-fold.ts operation for operation, including the guards that
+/// decline to fold (division by zero, negative or >256 exponents, negative
+/// sqrt) — those must stay identical or the tiers disagree about which
+/// programs fold at all, not merely about the folded value.
+///
+/// The previous fixed-width version wrapped: `pow`'s accumulator, `mulDiv`
+/// and `percentOf` all used `*%` on `i128`, so `pow(2n, 200n)` silently
+/// folded to `2^200 mod 2^128` == 0.
+fn evalBuiltinCall(
+    allocator: Allocator,
+    func_name: []const u8,
+    args: []const []const u8,
+    env: *const ConstEnv,
+) !?ConstValue {
     const tag = builtin_map.get(func_name) orelse return null;
 
-    // Resolve all args to integer constants
-    var int_args: [8]i128 = undefined;
+    // Resolve all args to integer constants, in either representation.
+    var big_args: [8]const_arith.Big = undefined;
     var count: usize = 0;
+    errdefer for (big_args[0..count]) |*m| m.deinit();
     for (args) |arg| {
-        const cv = env.get(arg) orelse return null;
-        if (cv != .integer) return null;
-        if (count >= 8) return null;
-        int_args[count] = cv.integer;
+        const cv = env.get(arg) orelse break;
+        if (count >= 8) break;
+        big_args[count] = (try const_arith.load(allocator, cv)) orelse break;
         count += 1;
     }
+    defer for (big_args[0..count]) |*m| m.deinit();
+    // A non-constant / non-integer argument means the call is not foldable.
+    if (count != args.len) return null;
 
-    return switch (tag) {
+    const Big = const_arith.Big;
+
+    switch (tag) {
         .builtin_abs => {
             if (count != 1) return null;
-            const n = int_args[0];
-            return .{ .integer = if (n < 0) -n else n };
+            var r = try Big.init(allocator);
+            defer r.deinit();
+            try r.copy(big_args[0].toConst());
+            r.abs();
+            return try const_arith.store(allocator, r);
         },
-        .builtin_min => {
+        .builtin_min, .builtin_max => {
             if (count != 2) return null;
-            return .{ .integer = @min(int_args[0], int_args[1]) };
+            const ord = const_arith.order(big_args[0], big_args[1]);
+            const pick: usize = switch (tag) {
+                .builtin_min => if (ord == .gt) 1 else 0,
+                else => if (ord == .lt) 1 else 0,
+            };
+            return try const_arith.store(allocator, big_args[pick]);
         },
-        .builtin_max => {
-            if (count != 2) return null;
-            return .{ .integer = @max(int_args[0], int_args[1]) };
-        },
-        .builtin_safediv => {
-            if (count != 2 or int_args[1] == 0) return null;
-            return .{ .integer = @divTrunc(int_args[0], int_args[1]) };
+        .builtin_safediv, .builtin_divmod => {
+            if (count != 2 or const_arith.isZero(big_args[1])) return null;
+            var q = try const_arith.divTrunc(allocator, big_args[0], big_args[1]);
+            defer q.deinit();
+            return try const_arith.store(allocator, q);
         },
         .builtin_safemod => {
-            if (count != 2 or int_args[1] == 0) return null;
-            const a = int_args[0];
-            const b = int_args[1];
-            return .{ .integer = a - @divTrunc(a, b) * b };
+            if (count != 2 or const_arith.isZero(big_args[1])) return null;
+            var r = try const_arith.remTrunc(allocator, big_args[0], big_args[1]);
+            defer r.deinit();
+            return try const_arith.store(allocator, r);
         },
         .builtin_clamp => {
+            // max(lo, min(val, hi))
             if (count != 3) return null;
-            const val = int_args[0];
-            const lo = int_args[1];
-            const hi = int_args[2];
-            return .{ .integer = @max(lo, @min(val, hi)) };
+            const val = big_args[0];
+            const lo = big_args[1];
+            const hi = big_args[2];
+            const upper: usize = if (const_arith.order(val, hi) == .gt) 2 else 0;
+            const clamped = if (const_arith.order(big_args[upper], lo) == .lt) lo else big_args[upper];
+            return try const_arith.store(allocator, clamped);
         },
         .builtin_sign => {
             if (count != 1) return null;
-            const n = int_args[0];
-            if (n > 0) return .{ .integer = 1 };
-            if (n < 0) return .{ .integer = -1 };
-            return .{ .integer = 0 };
+            const n = big_args[0];
+            if (const_arith.isZero(n)) return .{ .integer = 0 };
+            return .{ .integer = if (const_arith.isNegative(n)) -1 else 1 };
         },
         .builtin_pow => {
             if (count != 2) return null;
-            const base = int_args[0];
-            const exp = int_args[1];
-            if (exp < 0 or exp > 256) return null;
-            var result: i128 = 1;
-            var i: i128 = 0;
-            while (i < exp) : (i += 1) {
-                result *%= base;
-            }
-            return .{ .integer = result };
+            // Guard identical to the TS reference: a negative or >256
+            // exponent is left unfolded rather than approximated.
+            const exp = big_args[1].toConst().toInt(u32) catch return null;
+            if (exp > 256) return null;
+            var r = try Big.init(allocator);
+            defer r.deinit();
+            try r.pow(&big_args[0], exp);
+            return try const_arith.store(allocator, r);
         },
-        .builtin_mulDiv => {
-            if (count != 3 or int_args[2] == 0) return null;
-            const tmp = int_args[0] *% int_args[1];
-            return .{ .integer = @divTrunc(tmp, int_args[2]) };
-        },
-        .builtin_percentOf => {
-            if (count != 2) return null;
-            const tmp = int_args[0] *% int_args[1];
-            return .{ .integer = @divTrunc(tmp, 10000) };
+        .builtin_mulDiv, .builtin_percentOf => {
+            const want: usize = if (tag == .builtin_mulDiv) 3 else 2;
+            if (count != want) return null;
+
+            var divisor = if (tag == .builtin_mulDiv)
+                try Big.init(allocator)
+            else
+                try const_arith.fromI128(allocator, 10000);
+            defer divisor.deinit();
+            if (tag == .builtin_mulDiv) try divisor.copy(big_args[2].toConst());
+            if (const_arith.isZero(divisor)) return null;
+
+            var prod = try Big.init(allocator);
+            defer prod.deinit();
+            try prod.mul(&big_args[0], &big_args[1]);
+
+            var q = try const_arith.divTrunc(allocator, prod, divisor);
+            defer q.deinit();
+            return try const_arith.store(allocator, q);
         },
         .builtin_sqrt => {
             if (count != 1) return null;
-            const n = int_args[0];
-            if (n < 0) return null;
-            if (n == 0) return .{ .integer = 0 };
-            // Integer square root via Newton's method
-            var x = n;
-            var y = @divTrunc(x + 1, 2);
-            while (y < x) {
-                x = y;
-                y = @divTrunc(x + @divTrunc(n, x), 2);
+            const n = big_args[0];
+            if (const_arith.isNegative(n)) return null;
+            if (const_arith.isZero(n)) return .{ .integer = 0 };
+
+            // Newton's method, capped at 256 iterations and terminating when
+            // the next guess stops decreasing — the TS reference's exact
+            // loop, so both converge on the same value for every input.
+            var guess = try Big.init(allocator);
+            defer guess.deinit();
+            try guess.copy(n.toConst());
+
+            var two = try const_arith.fromI128(allocator, 2);
+            defer two.deinit();
+
+            var i: usize = 0;
+            while (i < 256) : (i += 1) {
+                var div = try const_arith.divTrunc(allocator, n, guess);
+                defer div.deinit();
+                var sum = try Big.init(allocator);
+                defer sum.deinit();
+                try sum.add(&guess, &div);
+                var next = try const_arith.divTrunc(allocator, sum, two);
+                defer next.deinit();
+                if (const_arith.order(next, guess) != .lt) break;
+                try guess.copy(next.toConst());
             }
-            return .{ .integer = x };
+            return try const_arith.store(allocator, guess);
         },
         .builtin_gcd => {
             if (count != 2) return null;
-            var a: i128 = if (int_args[0] < 0) -int_args[0] else int_args[0];
-            var b: i128 = if (int_args[1] < 0) -int_args[1] else int_args[1];
-            while (b != 0) {
-                const t = @mod(a, b);
-                a = b;
-                b = t;
+            var a = try Big.init(allocator);
+            defer a.deinit();
+            try a.copy(big_args[0].toConst());
+            a.abs();
+            var b = try Big.init(allocator);
+            defer b.deinit();
+            try b.copy(big_args[1].toConst());
+            b.abs();
+
+            while (!const_arith.isZero(b)) {
+                var r = try const_arith.remTrunc(allocator, a, b);
+                defer r.deinit();
+                try a.copy(b.toConst());
+                try b.copy(r.toConst());
             }
-            return .{ .integer = a };
-        },
-        .builtin_divmod => {
-            if (count != 2 or int_args[1] == 0) return null;
-            return .{ .integer = @divTrunc(int_args[0], int_args[1]) };
+            return try const_arith.store(allocator, a);
         },
         .builtin_log2 => {
             if (count != 1) return null;
-            const n = int_args[0];
-            if (n <= 0) return .{ .integer = 0 };
-            // Bit length - 1
-            var bits: i128 = 0;
-            var v = n;
-            while (v > 1) : (v = @divTrunc(v, 2)) {
-                bits += 1;
-            }
-            return .{ .integer = bits };
+            const n = big_args[0];
+            // n <= 0 folds to 0, matching the TS reference.
+            if (const_arith.isZero(n) or const_arith.isNegative(n)) return .{ .integer = 0 };
+            // Bit length - 1. `bitCountAbs` is exact for a positive value.
+            const bits = n.toConst().bitCountAbs();
+            return .{ .integer = @as(i128, @intCast(bits - 1)) };
         },
         .builtin_bool => {
             if (count != 1) return null;
-            return .{ .boolean = int_args[0] != 0 };
+            return .{ .boolean = !const_arith.isZero(big_args[0]) };
         },
-    };
+    }
 }
 
 // ============================================================================
@@ -394,7 +485,7 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
             const left_const = env.get(bo.left);
             const right_const = env.get(bo.right);
             if (left_const != null and right_const != null) {
-                if (evalBinOp(bo.op, left_const.?, right_const.?)) |result| {
+                if (try evalBinOp(allocator, bo.op, left_const.?, right_const.?)) |result| {
                     return constToAnfValue(result);
                 }
             }
@@ -404,7 +495,7 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
         .unary_op => |uo| {
             const operand_const = env.get(uo.operand);
             if (operand_const) |oc| {
-                if (evalUnaryOp(uo.op, oc)) |result| {
+                if (try evalUnaryOp(allocator, uo.op, oc)) |result| {
                     return constToAnfValue(result);
                 }
             }
@@ -412,7 +503,7 @@ fn foldValue(allocator: Allocator, value: ANFValue, env: *ConstEnv) anyerror!ANF
         },
 
         .call => |c| {
-            if (evalBuiltinCall(c.func, c.args, env)) |result| {
+            if (try evalBuiltinCall(allocator, c.func, c.args, env)) |result| {
                 return constToAnfValue(result);
             }
             return value;

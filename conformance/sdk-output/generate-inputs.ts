@@ -406,6 +406,19 @@ const TEST_SPECS: TestSpec[] = [
       { type: 'PubKey', value: PK },
     ],
   },
+  {
+    // Issue #162. The constructor arg is the sum the contract asserts —
+    // 85070591730234615893513767959916445698, a 126-bit value that needs a
+    // 16-byte script number. Every other bigint slot in this suite fits a
+    // machine word, so nothing here previously spliced a constructor value
+    // wider than 8 bytes, and a tier whose slot encoder narrowed to i64
+    // would have gone unnoticed. The compiler-side analogue of exactly that
+    // narrowing is what #162 fixed in the Zig tier.
+    name: 'integer-boundary',
+    constructorArgs: [
+      { type: 'bigint', value: '85070591730234615893513767959916445698' },
+    ],
+  },
 ];
 
 const TMP_DIR = join(__dirname, '.tmp');
