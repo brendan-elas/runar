@@ -1232,6 +1232,17 @@ jobs:
         run: cd conformance/sdk-output/tools/zig-sdk-tool && zig build -Doptimize=ReleaseFast
       - name: Build Java SDK driver
         run: cd conformance/sdk-output/tools/java-driver && gradle fatJar --no-daemon
+      - name: Assert sdk-output inputs match the current compiler
+        # input.json embeds a FROZEN artifact and expected-locking.hex is
+        # derived from it, so a codegen change that moves bytes leaves the
+        # pair internally consistent and this job green -- while the seven-SDK
+        # comparison below is agreeing on a script the compiler no longer
+        # emits. Four fixtures had drifted that way (boolean-logic still
+        # carried the 15-byte pre-NEW-014 script against 36 today;
+        # post-quantum-slhdsa / sphincs-wallet / tic-tac-toe carried pre-Any-S
+        # artifacts) and nothing failed. This recompiles every spec and fails
+        # on any difference. Mirrors the sdk-vertical:check gate.
+        run: cd conformance && npx tsx sdk-output/generate-inputs.ts --check
       - name: Run SDK output conformance (all contracts x 7 SDKs)
         run: cd conformance/sdk-output && npx tsx runner/sdk-runner.ts
       - name: Run vertical compiler<->SDK pins (constructorSlots + codeSeparator offsets)

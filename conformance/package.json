@@ -34,7 +34,8 @@
     "sdk-vertical:generate": "tsx sdk-vertical/generate.ts",
     "sdk-vertical:check": "tsx sdk-vertical/generate.ts --check",
     "differential-witness": "vitest run witnesses/differential.test.ts",
-    "mutation:score": "tsx mutation/run-mutation.ts"
+    "mutation:score": "tsx mutation/run-mutation.ts",
+    "sdk-output:check-inputs": "tsx sdk-output/generate-inputs.ts --check"
   },
   "dependencies": {
     "fast-check": "^3.22.0"

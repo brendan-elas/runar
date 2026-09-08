@@ -319,14 +319,31 @@ KNOWN_PYTHON_BITCOINLIB_MISMATCHES = {
     # the seven tiers — so the reference cannot evaluate it by construction.
     #
     # Recorded rather than glossed: the LEAN side also fails here, with
-    # "typeError: binary numeric op expects two ints". The Lean Stack VM's
-    # numeric ops are bounded below the language's arbitrary-precision domain
-    # in the same way the Zig tier was, so the model cannot evaluate these
-    # constants either. That is a real gap in the model — a Lean-side analogue
-    # of the defects #162 fixed in Zig — and it is NOT what this entry papers
-    # over. What this entry records is only that python-bitcoinlib yields zero
-    # oracle signal for a script it refuses to cast, so there is no cross-check
-    # to lose, exactly as for shift-ops above.
+    # "typeError: binary numeric op expects two ints" — but for a DIFFERENT
+    # reason than python-bitcoinlib, and the earlier version of this comment
+    # got the mechanism wrong, so it is worth stating precisely.
+    #
+    # It is NOT a magnitude bound. There WAS one — `Stack.Eval.asNum?` refused
+    # byte vectors wider than 4 bytes, the pre-Genesis CScriptNum operand
+    # limit — and that is fixed (2026-09-08), with #guards at 4/5/9/16 bytes
+    # pinning it open. It did not change this fixture's outcome.
+    #
+    # What actually happens: the ARITHMETIC opcodes (OP_ADD/OP_SUB/OP_MUL)
+    # deliberately keep the strictly-typed `liftIntBin`, which takes `asInt?`
+    # and so accepts only typed `vBigint`/`vBool` operands, never a `vBytes`.
+    # A PARSED script pushes its constants as byte vectors, so OP_ADD on two
+    # pushed constants type-errors at ANY width — 1 byte or 16. That strictness
+    # is a modelling choice pinned by theorems
+    # (`AgreesA3.liftIntBin_nonInt_top_isError` and
+    # `runOpcode_binopOpcode_emittable_nonInt_top_isError`), which assert the
+    # ANF type-error ⟷ Stack type-error lockstep for exactly +/-/*; widening
+    # `liftIntBin` would falsify them. Doing it properly needs the matching
+    # ANF-side story, which is a piece of work in its own right and not a
+    # drive-by. See the `asNum?` docstring in Stack/Eval.lean.
+    #
+    # Either way it is NOT what this entry papers over. This entry records only
+    # that python-bitcoinlib yields zero oracle signal for a script it refuses
+    # to cast, so there is no cross-check to lose, exactly as for shift-ops.
     "integer-boundary": "CastToBigNum() : overflow",
 }
 
