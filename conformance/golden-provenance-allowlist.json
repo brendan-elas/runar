@@ -2035,11 +2035,12 @@
     },
     {
       "path": "conformance/sdk-output/tests/tic-tac-toe/expected-locking.hex",
-      "sha256": "43689bf4d1093c2b81a27dc2e39655a15e0767a27ed3cffb3fc9b6a8d0e2ffd2",
-      "verified-against": "intentional-spec-change",
-      "reason": "Regenerated for the Any-S OP_PUSH_TX preimage-binding construction: the fixed binding blob emitted into every covenant method shrinks from 760 to 428 bytes (k=1 with r=Gx eliminating the k-inverse multiply; signing key d = 2^248*Gx^-1 mod n so the r*d addend is built on-stack; split/cat reversals; DER s taken from its minimal script-number encoding; branchless mod-n/low-S). Every changed golden is a pure function of the blob bytes: the delta is the blob substring plus recomputed offsets/lengths derived from it. Intentional spec change, corroborated by independent oracles: (1) the BSV Spend interpreter e2e suite (packages/runar-testing oppushtx-binding.test.ts) verifies the new blob ACCEPTS the genuine tx sighash preimage and REJECTS forged/decoupled and zeroed preimages (the BUG-100 exploit), across a 60-context sighash sweep plus 4 ground DER/low-S edge contexts (both malleation branches, 31-byte and 30-byte s); (2) the derived-key math (pubkey 02b405d7... = (2^248*Gx^-1 mod n)*G) was re-derived off-chain from the curve parameters alone; (3) all seven independently written tiers (TS, Go, Rust, Python, Ruby, Java, Zig) regenerate byte-identical goldens \u2014 conformance 72/72, sdk-output 59 cases x 7 SDKs clean, sdk-vertical 39/39 x 7 tiers, analyzer 24 pass / 0 fail; (4) 269 Go integration tests and 229 TS integration tests pass against a live bitcoin-sv regtest node, spending real covenant outputs that carry the new blob.",
-      "reviewer": "gh:brendan-elas",
-      "date": "2026-09-01"
+      "sha256": "6e1ccb555c564e86945e2d4134ac5515b6359cc903136be4ca8e20b883039450",
+      "verified-against": "second-implementation",
+      "reason": "REFRESH OF A STALE ARTIFACT, not a codegen change. This fixture's sdk-output input.json embedded a FROZEN compiler artifact that the compiler had stopped producing; expected-locking.hex is derived from that artifact, so the pair stayed internally consistent and the job stayed green while the seven-SDK comparison agreed about a script no longer shipped. Regenerating the input moves the derived hex with it.\n\nNo compiler bytes changed in this commit: the conformance goldens under conformance/tests are untouched, and this fixture's compiled script is the one main already ships and already justifies. What changed is that the SDK suite now measures THAT script instead of a historical one.\n\nCross-check: seven independently written deployment SDKs (TypeScript, Go, Rust, Python, Zig, Ruby, Java) each rebuild the locking script from the refreshed artifact and are compared byte-for-byte against this pin and against each other by the required 'SDK Output Conformance' job -- 61 fixtures PASS, 0 FAIL, coverage audit clean.\n\nRecurrence is gated rather than trusted: generate-inputs.ts --check recompiles every spec and fails on any difference, and CI runs it ahead of the runner. Verified to bite -- on the pre-fix tree it names exactly the four drifted fixtures with their on-disk vs fresh sizes and exits 1.\n\nSpecifics: the stored artifact carried a 7502-byte script -- #161's number at ITS OWN base, before NEW-014 merged underneath it. The merged compiler emits 7624 (main's 9616 minus 6 covenant methods x 332 bytes of Any-S blob shrink), which is the figure the byte pins in the python, ruby, zig and go example suites assert. SUPERSEDES the previous entry here (sha 43689bf4, gh:brendan-elas), which pinned the 7502-byte artifact and was correct for the branch it was written on.",
+      "reviewer": "gh:icellan",
+      "review-status": "reviewed",
+      "date": "2026-09-08"
     },
     {
       "path": "conformance/sdk-output/tests/token-ft/expected-locking.hex",
@@ -2107,6 +2108,33 @@
       "reviewer": "gh:icellan",
       "review-status": "reviewed",
       "date": "2026-09-07"
+    },
+    {
+      "path": "conformance/sdk-output/tests/boolean-logic/expected-locking.hex",
+      "sha256": "f3cadb156c3eefbaf910d05a3ba84b7806a72fd4944bebf6aef5a008034fe016",
+      "verified-against": "second-implementation",
+      "reason": "REFRESH OF A STALE ARTIFACT, not a codegen change. This fixture's sdk-output input.json embedded a FROZEN compiler artifact that the compiler had stopped producing; expected-locking.hex is derived from that artifact, so the pair stayed internally consistent and the job stayed green while the seven-SDK comparison agreed about a script no longer shipped. Regenerating the input moves the derived hex with it.\n\nNo compiler bytes changed in this commit: the conformance goldens under conformance/tests are untouched, and this fixture's compiled script is the one main already ships and already justifies. What changed is that the SDK suite now measures THAT script instead of a historical one.\n\nCross-check: seven independently written deployment SDKs (TypeScript, Go, Rust, Python, Zig, Ruby, Java) each rebuild the locking script from the refreshed artifact and are compared byte-for-byte against this pin and against each other by the required 'SDK Output Conformance' job -- 61 fixtures PASS, 0 FAIL, coverage audit clean.\n\nRecurrence is gated rather than trusted: generate-inputs.ts --check recompiles every spec and fails on any difference, and CI runs it ahead of the runner. Verified to bite -- on the pre-fix tree it names exactly the four drifted fixtures with their on-disk vs fresh sizes and exits 1.\n\nSpecifics: the stored artifact carried the 15-byte PRE-NEW-014 script, from before `&&` / `||` began short-circuiting on-chain; the compiler emits 36 bytes today. The widest drift of the four, and the clearest illustration of why the gate was needed -- OP_BOOLAND evaluates both operands, the very hazard NEW-014 removed, and the SDK suite was still measuring the pre-fix shape.",
+      "reviewer": "gh:icellan",
+      "review-status": "reviewed",
+      "date": "2026-09-08"
+    },
+    {
+      "path": "conformance/sdk-output/tests/post-quantum-slhdsa/expected-locking.hex",
+      "sha256": "f35dc77546f558e9b8f95df4d3cc83b2fb1b70011b6ed4173e00935ebd1839be",
+      "verified-against": "second-implementation",
+      "reason": "REFRESH OF A STALE ARTIFACT, not a codegen change. This fixture's sdk-output input.json embedded a FROZEN compiler artifact that the compiler had stopped producing; expected-locking.hex is derived from that artifact, so the pair stayed internally consistent and the job stayed green while the seven-SDK comparison agreed about a script no longer shipped. Regenerating the input moves the derived hex with it.\n\nNo compiler bytes changed in this commit: the conformance goldens under conformance/tests are untouched, and this fixture's compiled script is the one main already ships and already justifies. What changed is that the SDK suite now measures THAT script instead of a historical one.\n\nCross-check: seven independently written deployment SDKs (TypeScript, Go, Rust, Python, Zig, Ruby, Java) each rebuild the locking script from the refreshed artifact and are compared byte-for-byte against this pin and against each other by the required 'SDK Output Conformance' job -- 61 fixtures PASS, 0 FAIL, coverage audit clean.\n\nRecurrence is gated rather than trusted: generate-inputs.ts --check recompiles every spec and fails on any difference, and CI runs it ahead of the runner. Verified to bite -- on the pre-fix tree it names exactly the four drifted fixtures with their on-disk vs fresh sizes and exits 1.\n\nSpecifics: 188597 B stored vs 188582 B fresh -- the same 15-byte SLH-DSA delta the script-size baseline rows for this fixture were re-derived for in #165. Both files had drifted from the same underlying change and are now consistent with each other and with the golden.",
+      "reviewer": "gh:icellan",
+      "review-status": "reviewed",
+      "date": "2026-09-08"
+    },
+    {
+      "path": "conformance/sdk-output/tests/sphincs-wallet/expected-locking.hex",
+      "sha256": "48160d58550488f32c5e5e41f67a5110922fa0def1c1d8f109afbad00e299835",
+      "verified-against": "second-implementation",
+      "reason": "REFRESH OF A STALE ARTIFACT, not a codegen change. This fixture's sdk-output input.json embedded a FROZEN compiler artifact that the compiler had stopped producing; expected-locking.hex is derived from that artifact, so the pair stayed internally consistent and the job stayed green while the seven-SDK comparison agreed about a script no longer shipped. Regenerating the input moves the derived hex with it.\n\nNo compiler bytes changed in this commit: the conformance goldens under conformance/tests are untouched, and this fixture's compiled script is the one main already ships and already justifies. What changed is that the SDK suite now measures THAT script instead of a historical one.\n\nCross-check: seven independently written deployment SDKs (TypeScript, Go, Rust, Python, Zig, Ruby, Java) each rebuild the locking script from the refreshed artifact and are compared byte-for-byte against this pin and against each other by the required 'SDK Output Conformance' job -- 61 fixtures PASS, 0 FAIL, coverage audit clean.\n\nRecurrence is gated rather than trusted: generate-inputs.ts --check recompiles every spec and fails on any difference, and CI runs it ahead of the runner. Verified to bite -- on the pre-fix tree it names exactly the four drifted fixtures with their on-disk vs fresh sizes and exits 1.\n\nSpecifics: 188609 B stored vs 188594 B fresh -- same 15-byte SLH-DSA delta and same story as post-quantum-slhdsa.",
+      "reviewer": "gh:icellan",
+      "review-status": "reviewed",
+      "date": "2026-09-08"
     }
   ]
 }
