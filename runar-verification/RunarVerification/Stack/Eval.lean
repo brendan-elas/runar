@@ -137,8 +137,19 @@ epilogue's varint encoder (`… push 253; OP_LESSTHAN …`) feeds a byte
 vector to a numeric opcode.  Consensus ACCEPTS that (the bytes ARE the
 number); the bare `asInt?` rejects it.
 
-`asNum?` is the faithful operand coercion: byte vectors of ≤ 4 bytes
-decode via `decodeMinimalLE`; every other value falls back to `asInt?`.
+`asNum?` is the faithful operand coercion: byte vectors decode via
+`decodeMinimalLE`; every other value falls back to `asInt?`.
+
+**Operand width (2026-09-08).** This used to reject byte vectors wider
+than 4 bytes — the PRE-Genesis `CScriptNum` operand limit. BSV removed
+that limit at Genesis and this repo depends on it having gone: the
+`integer-boundary` fixture (issue #162) emits 9- and 16-byte script
+numbers and all seven tiers agree those are the correct bytes, so a
+model that refuses to decode them is modelling a different chain. The
+bound is gone; `decodeMinimalLE` was already arbitrary-width, so the
+guard was pure policy rather than a capability limit. The `#guard`s
+below pin 4, 5, 9 and 16 bytes plus a negative, so the ceiling cannot
+quietly come back.
 It is wired into the COMPARISON and numeric-SELECT opcodes that the
 deployed-bytes machinery feeds byte-encoded literals to:
 `OP_LESSTHAN`, `OP_GREATERTHAN`, `OP_LESSTHANOREQUAL`,
@@ -163,12 +174,42 @@ there would falsify them.  Extend further opcode-by-opcode (with the
 matching ANF-side story) as future walks require. -/
 def asNum? (v : Value) : Option Int :=
   match v with
-  | .vBytes b => if b.size ≤ 4 then some (decodeMinimalLE b) else none
+  | .vBytes b => some (decodeMinimalLE b)
   | v => asInt? v
 
 @[simp] theorem asNum?_vBigint (i : Int) : asNum? (.vBigint i) = some i := rfl
 @[simp] theorem asNum?_vBool (b : Bool) :
     asNum? (.vBool b) = some (if b then 1 else 0) := rfl
+
+/-! ### Operand-width regression guards (post-Genesis CScriptNum)
+
+BSV removed the 4-byte CScriptNum operand limit at Genesis, and this
+repo's own compiler relies on that: the `integer-boundary` fixture
+(issue #162) emits 9- and 16-byte script numbers, and the seven tiers
+agree those are the correct bytes. A model that rejects an operand
+purely for being wider than 4 bytes is modelling PRE-Genesis Bitcoin,
+not the chain this project targets.
+
+These `#guard`s pin the widths that matter at the boundary: 4 bytes
+(the old ceiling), 5 (the first width the old bound rejected), 9
+(`2^64`, as `integer-boundary` pushes it) and 16 (`(2^63-1)^2`). -/
+
+-- 4 bytes: 0x7fffffff — the largest value the pre-Genesis bound admitted.
+#guard (asNum? (.vBytes ⟨#[0xff, 0xff, 0xff, 0x7f]⟩) == some 2147483647)
+
+-- 5 bytes: one past the old ceiling. 0x00_ffffffff = 4294967295.
+#guard (asNum? (.vBytes ⟨#[0xff, 0xff, 0xff, 0xff, 0x00]⟩) == some 4294967295)
+
+-- 9 bytes: 2^64, exactly as integer-boundary pushes it.
+#guard (asNum? (.vBytes ⟨#[0, 0, 0, 0, 0, 0, 0, 0, 1]⟩) == some 18446744073709551616)
+
+-- 16 bytes: (2^63-1)^2, the widest constant integer-boundary carries.
+#guard (asNum? (.vBytes ⟨#[1, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f]⟩)
+          == some 85070591730234615847396907784232501249)
+
+-- The sign bit still governs at every width: the 5-byte encoding of
+-- -4294967295 differs from its positive twin only in the top bit.
+#guard (asNum? (.vBytes ⟨#[0xff, 0xff, 0xff, 0xff, 0x80]⟩) == some (-4294967295))
 
 /-! ## Primitive stack-manipulation ops -/
 
@@ -261,8 +302,8 @@ def liftIntBin (s : StackState) (f : Int → Int → Value) : EvalResult StackSt
       | _ => .error (.unsupported "binary op popN bug")
 
 /-- `liftIntBin` with the consensus `asNum?` operand coercion (see the
-`asNum?` docstring): byte-vector operands of ≤ 4 bytes decode as
-CScriptNum numbers instead of type-erroring.  Used by `OP_LESSTHAN`
+`asNum?` docstring): byte-vector operands decode as CScriptNum numbers
+instead of type-erroring, at any width.  Used by `OP_LESSTHAN`
 only (for now). -/
 def liftIntBinNum (s : StackState) (f : Int → Int → Value) : EvalResult StackState :=
   match popN s 2 with
