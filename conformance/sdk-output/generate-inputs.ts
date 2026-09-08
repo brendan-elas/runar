@@ -437,6 +437,28 @@ const TEST_SPECS: TestSpec[] = [
 const TMP_DIR = join(__dirname, '.tmp');
 if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true });
 
+/**
+ * `--check`: recompile every spec and FAIL if the checked-in input.json
+ * differs from what the compiler produces today, instead of rewriting it.
+ *
+ * Why this mode has to exist. `input.json` embeds a FROZEN artifact, and
+ * sdk-runner compares the seven SDKs against `expected-locking.hex` built
+ * from that artifact. Nothing tied either file to the current compiler, so
+ * a codegen change that moved bytes left the pair internally consistent and
+ * the suite green — while silently testing seven-SDK agreement on a script
+ * the compiler no longer emits.
+ *
+ * That is not hypothetical. Four fixtures had drifted this way before this
+ * flag existed: boolean-logic still carried the 15-byte pre-NEW-014 script
+ * where the compiler now emits 36, and post-quantum-slhdsa, sphincs-wallet
+ * and tic-tac-toe carried pre-Any-S artifacts (#161). Each was found only
+ * by regenerating by hand and noticing the diff.
+ *
+ * Mirrors `sdk-vertical:check`, which guards its own fixtures the same way.
+ */
+const CHECK_ONLY = process.argv.includes('--check');
+const drifted: string[] = [];
+
 for (const spec of TEST_SPECS) {
   let sourceRel: string;
   try {
@@ -482,9 +504,51 @@ for (const spec of TEST_SPECS) {
 
   const input = { artifact, constructorArgs: spec.constructorArgs };
   const testDir = join(TESTS_DIR, spec.name);
+  const inputPath = join(testDir, 'input.json');
+  const rendered = JSON.stringify(input, null, 2) + '\n';
+
+  if (CHECK_ONLY) {
+    if (!existsSync(inputPath)) {
+      drifted.push(`${spec.name} (no input.json on disk)`);
+      console.error(`  DRIFT ${spec.name}: input.json missing`);
+      continue;
+    }
+    const onDisk = readFileSync(inputPath, 'utf-8');
+    if (onDisk !== rendered) {
+      const storedScript = (JSON.parse(onDisk).artifact ?? {}).script ?? '';
+      const freshScript = artifact.script ?? '';
+      const detail =
+        storedScript === freshScript
+          ? 'artifact metadata differs'
+          : `script ${storedScript.length / 2} B on disk vs ${freshScript.length / 2} B fresh`;
+      drifted.push(`${spec.name} (${detail})`);
+      console.error(`  DRIFT ${spec.name}: ${detail}`);
+    } else {
+      console.log(`  ok ${spec.name}`);
+    }
+    continue;
+  }
+
   if (!existsSync(testDir)) mkdirSync(testDir, { recursive: true });
-  writeFileSync(join(testDir, 'input.json'), JSON.stringify(input, null, 2) + '\n');
+  writeFileSync(inputPath, rendered);
   console.log(`  Wrote ${spec.name}/input.json`);
 }
 
-console.log('\nDone. Run SDK tools to generate expected-locking.hex files.');
+if (CHECK_ONLY) {
+  if (drifted.length > 0) {
+    console.error(
+      `\n✗ sdk-output input drift: ${drifted.length} fixture(s) carry a FROZEN artifact that the\n` +
+        `  compiler no longer produces. expected-locking.hex is derived from that artifact, so the\n` +
+        `  seven-SDK comparison for these fixtures is agreeing on a script that is no longer shipped:\n` +
+        drifted.map((d) => `    - ${d}`).join('\n') +
+        `\n\n  Fix: npx tsx conformance/sdk-output/generate-inputs.ts` +
+        `\n       npx tsx conformance/sdk-output/runner/sdk-runner.ts --update-golden` +
+        `\n  Regenerate the INPUT first — refreshing only the expected hex compares fresh SDK` +
+        `\n  output against a stale codePart and proves nothing.\n`,
+    );
+    process.exit(1);
+  }
+  console.log('\n✓ sdk-output inputs match the current compiler.');
+} else {
+  console.log('\nDone. Run SDK tools to generate expected-locking.hex files.');
+}
